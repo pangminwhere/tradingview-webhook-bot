@@ -2,43 +2,31 @@
 
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
-import ccxt
-from app.state import last_trade
+from app.state import last_trade  # entry, side, symbol 등 저장된 상태
 
 router = APIRouter()
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    s = last_trade
-    html = """
-    <html>
-      <head>
-        <meta http-equiv="refresh" content="5">
-        <title>Trade Dashboard</title>
-      </head>
-      <body>
-        <h1>Trade Status</h1>
-    """
-    if not s["symbol"]:
-        html += "<p>No trades executed yet.</p>"
-    else:
-        # 현재가 가져오기
-        ex = ccxt.binance()
-        ticker = ex.fetch_ticker(s["symbol"])
-        last_price = float(ticker["last"])
-        entry      = s["entry"]
-        if s["side"] == "long":
-            pnl_pct = (last_price/entry - 1) * 100
-        else:
-            pnl_pct = (entry/last_price - 1) * 100
+def dashboard():
+    symbol = last_trade.get("symbol", SYMBOL)
+    side   = last_trade.get("side", "-")
+    entry  = last_trade.get("entry", 0.0)
+    # 현재가 조회 (예: ccxt나 클라이언트에서)
+    last_price = fetch_current_price(symbol)
 
-        html += f"<p>Symbol: {s['symbol']}</p>"
-        html += f"<p>Side: {s['side']}</p>"
-        html += f"<p>Entry Price: {entry:.4f}</p>"
-        html += f"<p>Current Price: {last_price:.4f}</p>"
-        html += f"<p>Unrealized PnL: {pnl_pct:.2f}%</p>"
-    html += """
-      </body>
-    </html>
+    if entry and entry > 0:
+        pnl_pct = (last_price / entry - 1) * 100 if side == "long" else (entry / last_price - 1) * 100
+        pnl_str = f"{pnl_pct:.2f}%"
+    else:
+        # 진입가가 없으면 아직 포지션 없음
+        pnl_str = "-"
+
+    html = f"""
+    <h1>Trade Status</h1>
+    <p>Symbol: {symbol}</p>
+    <p>Side: {side}</p>
+    <p>Entry Price: {entry if entry>0 else '-'}</p>
+    <p>Current Price: {last_price}</p>
+    <p>Unrealized PnL: {pnl_str}</p>
     """
-    return html
+    return HTMLResponse(html)
