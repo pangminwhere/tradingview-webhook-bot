@@ -52,7 +52,7 @@ class TradeManager:
                 return float(p["info"].get("positionAmt", 0))
         return 0.0
 
-    def _wait_for_position_close(self):
+    def _wait_for_position_close(self) -> bool:
         start = time.time()
         while time.time() - start < MAX_WAIT:
             if self._position_amt() == 0:
@@ -70,7 +70,7 @@ class TradeManager:
         market = self.exchange.market(SYMBOL)
         min_cost = market["limits"]["cost"]["min"]
         if alloc_usdt < min_cost:
-            logger.warning(f"[CalcQty] alloc_usdt ${alloc_usdt:.4f} < min_notional ${min_cost}, skip trade")
+            logger.warning(f"[CalcQty] alloc_usdt ${alloc_usdt:.4f} < min_notional ${min_cost}, skip")
             return 0.0
         raw_qty = alloc_usdt / price
         min_amt = market["limits"]["amount"]["min"]
@@ -81,11 +81,11 @@ class TradeManager:
         logger.info(f"[CalcQty] Alloc ${alloc_usdt:.4f} → Qty {qty:.6f} {SYMBOL}")
         return qty
 
-    def buy(self):
+    def buy(self) -> dict:
         market_id = SYMBOL.replace("/", "")
         if DRY_RUN:
             logger.info("[DRY_RUN] BUY skipped")
-            return {}
+            return {"skipped": "dry_run"}
 
         # Setup
         self.exchange.load_markets()
@@ -93,51 +93,48 @@ class TradeManager:
         self._set_leverage(market_id)
         self._cancel_tp_sl(market_id)
 
-        # Record existing position
         existing_amt = self._position_amt()
+        # Skip if already long
+        if existing_amt > 0:
+            logger.info("[Skip] Already in long position")
+            return {"skipped": "already_long"}
 
-        # 1) Close opposite short
+        # 1) Close short if exists
         if existing_amt < 0:
-            close = self.exchange.create_market_buy_order(SYMBOL, abs(existing_amt))
+            self.exchange.create_market_buy_order(SYMBOL, abs(existing_amt))
             logger.info(f"[CloseShort] qty={abs(existing_amt)}")
             if not self._wait_for_position_close():
                 logger.error("Failed to close short, abort buy")
-                return {}
+                return {"skipped": "close_failed"}
             trade_qty = abs(existing_amt)
         else:
+            # 2) Calc new qty
             trade_qty = self._calc_qty()
             if trade_qty <= 0:
-                return {}
+                return {"skipped": "calc_qty_zero"}
 
-        # Skip if already long
-        if self._position_amt() > 0:
-            logger.info("[Skip] Already long")
-            return {}
-
-        # 2) Market buy
+        # 3) Market buy
         order = self.exchange.create_market_buy_order(SYMBOL, trade_qty)
         filled = float(order.get("filled", order.get("amount", 0)))
         entry_price = float(order.get("average", order.get("price", 0)))
         logger.info(f"[BUY] qty={filled}@{entry_price}")
 
-        # 3) TP
+        # 4) TP & SL
         tp_qty = filled * TP_PART_RATIO
         tp_price = entry_price * TP_RATIO
         self.exchange.create_limit_sell_order(SYMBOL, tp_qty, tp_price, {"reduceOnly": True})
-        logger.info(f"[TP] qty={tp_qty}@{tp_price}")
-
-        # 4) SL
         sl_price = entry_price * SL_RATIO
-        self.exchange.create_order(SYMBOL, "STOP_MARKET", "sell", filled, None, {"stopPrice": sl_price, "reduceOnly": True})
-        logger.info(f"[SL] qty={filled}@{sl_price}")
+        self.exchange.create_order(SYMBOL, "STOP_MARKET", "sell", filled, None,
+                                   {"stopPrice": sl_price, "reduceOnly": True})
+        logger.info(f"[TP] qty={tp_qty}@{tp_price} | [SL] qty={filled}@{sl_price}")
 
         return {"buy": order}
 
-    def sell(self):
+    def sell(self) -> dict:
         market_id = SYMBOL.replace("/", "")
         if DRY_RUN:
             logger.info("[DRY_RUN] SELL skipped")
-            return {}
+            return {"skipped": "dry_run"}
 
         # Setup
         self.exchange.load_markets()
@@ -145,42 +142,39 @@ class TradeManager:
         self._set_leverage(market_id)
         self._cancel_tp_sl(market_id)
 
-        # Record existing long
         existing_amt = self._position_amt()
+        # Skip if already short
+        if existing_amt < 0:
+            logger.info("[Skip] Already in short position")
+            return {"skipped": "already_short"}
 
-        # 1) Close opposite long
+        # 1) Close long if exists
         if existing_amt > 0:
-            close = self.exchange.create_market_sell_order(SYMBOL, existing_amt)
+            self.exchange.create_market_sell_order(SYMBOL, existing_amt)
             logger.info(f"[CloseLong] qty={existing_amt}")
             if not self._wait_for_position_close():
                 logger.error("Failed to close long, abort sell")
-                return {}
+                return {"skipped": "close_failed"}
             trade_qty = existing_amt
         else:
+            # 2) Calc new qty
             trade_qty = self._calc_qty()
             if trade_qty <= 0:
-                return {}
+                return {"skipped": "calc_qty_zero"}
 
-        # Skip if already short
-        if self._position_amt() < 0:
-            logger.info("[Skip] Already short")
-            return {}
-
-        # 2) Market sell
+        # 3) Market sell
         order = self.exchange.create_market_sell_order(SYMBOL, trade_qty)
         filled = float(order.get("filled", order.get("amount", 0)))
         entry_price = float(order.get("average", order.get("price", 0)))
         logger.info(f"[SELL] qty={filled}@{entry_price}")
 
-        # 3) TP
+        # 4) TP & SL
         tp_qty = filled * TP_PART_RATIO
         tp_price = entry_price / TP_RATIO
         self.exchange.create_limit_buy_order(SYMBOL, tp_qty, tp_price, {"reduceOnly": True})
-        logger.info(f"[TP] qty={tp_qty}@{tp_price}")
-
-        # 4) SL
         sl_price = entry_price / SL_RATIO
-        self.exchange.create_order(SYMBOL, "STOP_MARKET", "buy", filled, None, {"stopPrice": sl_price, "reduceOnly": True})
-        logger.info(f"[SL] qty={filled}@{sl_price}")
+        self.exchange.create_order(SYMBOL, "STOP_MARKET", "buy", filled, None,
+                                   {"stopPrice": sl_price, "reduceOnly": True})
+        logger.info(f"[TP] qty={tp_qty}@{tp_price} | [SL] qty={filled}@{sl_price}")
 
         return {"sell": order}
