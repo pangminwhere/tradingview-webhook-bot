@@ -1,18 +1,16 @@
-# app/services/trade_manager.py
-
 import logging
 import ccxt
 
 logger = logging.getLogger("trade_manager")
 
-# ———————————————————————
+# —————————————————————
 # 거래 파라미터
 TRADE_AMOUNT    = 50      # USDT 기준 50달러 어치
 TRADE_LEVERAGE  = 1       # 1배 레버리지
 TP_RATIO        = 1.005   # +0.5% 익절
 TP_PART_RATIO   = 0.5     # 익절 물량 비율(50%)
-SL_RATIO        = 0.995   # -0.5% 손절 (진입가 * 0.995)
-# ———————————————————————
+SL_RATIO        = 0.995   # -0.5% 손절
+# —————————————————————
 
 class TradeManager:
     def __init__(self, api_key: str, secret: str):
@@ -44,12 +42,12 @@ class TradeManager:
         # 2) 기존 TP/SL 주문 취소
         self._cancel_tp_orders(symbol)
 
-        # 3) 숏 포지션 전량 청산 (if any)
+        # 3) 숏 포지션이 있으면 전량 청산 (base 수량 기준)
         pos_amt = self._fetch_position_amount(symbol)
         if pos_amt < 0:
-            close_short = self.exchange.create_order(
-                symbol, "market", "buy", None, None,
-                {"quoteOrderQty": abs(pos_amt) * 0}  # 기존 숏 청산: 시장가 전량 청산
+            close_short = self.exchange.create_market_buy_order(
+                symbol,
+                abs(pos_amt)  # base 단위
             )
             results["close_short"] = close_short
             logger.info(f"Closed short: qty={abs(pos_amt)}")
@@ -61,11 +59,12 @@ class TradeManager:
             return results
 
         # 5) 시장가 롱 진입 ($50 어치)
-        order = self.exchange.create_order(
-            symbol, "market", "buy", None, None,
+        order = self.exchange.create_market_buy_order(
+            symbol,
+            None,
             {"quoteOrderQty": TRADE_AMOUNT}
         )
-        # 체결된 기본 통화 수량과 평균가 추출
+        # 체결된 base 수량과 평균가 추출
         filled_qty  = float(order.get("filled", order.get("amount", 0)))
         entry_price = float(order.get("average", order.get("price", 0)))
         results["buy"] = order
@@ -75,16 +74,22 @@ class TradeManager:
         tp_qty   = filled_qty * TP_PART_RATIO
         tp_price = entry_price * TP_RATIO
         tp_order = self.exchange.create_limit_sell_order(
-            symbol, tp_qty, tp_price,
+            symbol,
+            tp_qty,
+            tp_price,
             {"reduceOnly": True}
         )
         results["tp"] = tp_order
         logger.info(f"TP order: qty={tp_qty}@{tp_price}")
 
-        # 7) 손절(stop-loss) 시장가 주문 (전량)
+        # 7) 손절(stop-loss) 주문 (전량, STOP_MARKET)
         sl_price = entry_price * SL_RATIO
         sl_order = self.exchange.create_order(
-            symbol, "STOP_MARKET", "sell", filled_qty, None,
+            symbol,
+            "STOP_MARKET",
+            "sell",
+            filled_qty,
+            None,
             {"stopPrice": sl_price, "reduceOnly": True}
         )
         results["sl"] = sl_order
@@ -101,10 +106,13 @@ class TradeManager:
         # 2) 기존 TP/SL 주문 취소
         self._cancel_tp_orders(symbol)
 
-        # 3) 롱 포지션 전량 청산 (if any)
+        # 3) 롱 포지션 전량 청산 (base 수량 기준)
         pos_amt = self._fetch_position_amount(symbol)
         if pos_amt > 0:
-            close_long = self.exchange.create_market_sell_order(symbol, pos_amt)
+            close_long = self.exchange.create_market_sell_order(
+                symbol,
+                pos_amt  # base 단위
+            )
             results["close_long"] = close_long
             logger.info(f"Closed long: qty={pos_amt}")
 
@@ -115,8 +123,9 @@ class TradeManager:
             return results
 
         # 5) 시장가 숏 진입 ($50 어치)
-        order = self.exchange.create_order(
-            symbol, "market", "sell", None, None,
+        order = self.exchange.create_market_sell_order(
+            symbol,
+            None,
             {"quoteOrderQty": TRADE_AMOUNT}
         )
         filled_qty  = float(order.get("filled", order.get("amount", 0)))
@@ -128,16 +137,22 @@ class TradeManager:
         tp_qty   = filled_qty * TP_PART_RATIO
         tp_price = entry_price / TP_RATIO
         tp_order = self.exchange.create_limit_buy_order(
-            symbol, tp_qty, tp_price,
+            symbol,
+            tp_qty,
+            tp_price,
             {"reduceOnly": True}
         )
         results["tp"] = tp_order
         logger.info(f"SHORT TP order: qty={tp_qty}@{tp_price}")
 
-        # 7) 숏 손절 시장가 주문
+        # 7) 숏 손절(stop-loss) 주문
         sl_price = entry_price / SL_RATIO
         sl_order = self.exchange.create_order(
-            symbol, "STOP_MARKET", "buy", filled_qty, None,
+            symbol,
+            "STOP_MARKET",
+            "buy",
+            filled_qty,
+            None,
             {"stopPrice": sl_price, "reduceOnly": True}
         )
         results["sl"] = sl_order
