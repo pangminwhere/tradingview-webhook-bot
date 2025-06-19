@@ -1,149 +1,162 @@
-# app/services/trade_manager.py
-
 import logging
 import ccxt
+from app.config import EX_API_KEY, EX_API_SECRET, DRY_RUN
 
 logger = logging.getLogger("trade_manager")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# —————————————————————
-# 거래 파라미터
-TRADE_LEVERAGE  = 1       # 1배 레버리지
-TP_RATIO        = 1.005   # +0.5% 익절
-TP_PART_RATIO   = 0.5     # 익절 물량 비율(50%)
-SL_RATIO        = 0.995   # -0.5% 손절
-BUY_PCT         = 0.98    # 잔고의 98% 사용
-# —————————————————————
+# ── 설정값 ────────────────────────────────────
+SYMBOL          = "ETH/USDT"
+BUY_PCT         = 0.98      # 잔고의 98% 사용
+TRADE_LEVERAGE  = 1         # 1배 레버리지
+TP_RATIO        = 1.005     # +0.5% 익절
+TP_PART_RATIO   = 0.5       # 익절 비율 50%
+SL_RATIO        = 0.995     # -0.5% 손절
+# ─────────────────────────────────────────────
 
 class TradeManager:
-    def __init__(self, api_key: str, secret: str):
-        self.exchange = ccxt.binance({
-            "apiKey":    api_key,
-            "secret":    secret,
-            "options":   {"defaultType": "future"}
-        })
+    def __init__(self, testnet: bool = False):
+        params = {
+            "apiKey": EX_API_KEY,
+            "secret": EX_API_SECRET,
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        }
+        # USDT-M Futures 전용 인스턴스
+        self.exchange = ccxt.binanceusdm(params)
+        if testnet:
+            self.exchange.set_sandbox_mode(True)
 
-    def _cancel_tp_orders(self, symbol: str):
-        for o in self.exchange.fetch_open_orders(symbol):
-            if o.get("info", {}).get("reduceOnly"):
-                self.exchange.cancel_order(o["id"], symbol)
-                logger.info(f"Canceled reduceOnly order {o['id']}")
+    def _set_isolated(self, market_id: str):
+        """Isolated margin 모드로 전환"""
+        try:
+            self.exchange.set_margin_mode("isolated", market_id)
+            logger.info(f"[Margin] Set ISOLATED for {market_id}")
+        except Exception as e:
+            logger.warning(f"[Margin] Could not set isolated: {e}")
 
-    def _fetch_position_amount(self, symbol: str) -> float:
-        amt = 0.0
-        for p in self.exchange.fetch_positions([symbol]):
-            if p["symbol"] == symbol:
-                amt = float(p["info"]["positionAmt"])
-        return amt
+    def _set_leverage(self, market_id: str):
+        """레버리지 설정"""
+        self.exchange.set_leverage(TRADE_LEVERAGE, market_id)
+        logger.info(f"[Leverage] {TRADE_LEVERAGE}x for {market_id}")
 
-    def _calc_buy_amount(self) -> float:
+    def _calc_qty(self, symbol: str) -> float:
+        """잔고의 BUY_PCT 만큼 USDT → base 수량 환산"""
         bal = self.exchange.fetch_balance()
-        free_usdt = float(bal["free"]["USDT"])
-        return free_usdt * BUY_PCT
+        free_usdt = float(bal["free"].get("USDT", 0))
+        alloc_usdt = free_usdt * BUY_PCT
+        price = float(self.exchange.fetch_ticker(symbol)["last"])
+        qty = alloc_usdt / price
+        logger.info(f"[CalcQty] Free {free_usdt:.4f} USDT → Alloc {alloc_usdt:.4f} USDT → Qty {qty:.6f} {symbol}")
+        return qty
 
-    def buy(self, symbol: str):
-        results = {}
+    def _cancel_tp_sl(self, market_id: str):
+        """기존 TP/SL (reduceOnly) 주문 모두 취소"""
+        for o in self.exchange.fetch_open_orders(market_id):
+            if o.get("info", {}).get("reduceOnly"):
+                self.exchange.cancel_order(o["id"], market_id)
+                logger.info(f"[Cancel] reduceOnly {o['id']}")
 
-        # 1) 레버리지 설정
-        self.exchange.set_leverage(TRADE_LEVERAGE, symbol)
+    def buy(self):
+        """ETH/USDT 롱 진입 + TP/SL"""
+        market_id = SYMBOL.replace("/", "")
+        if DRY_RUN:
+            logger.info("[DRY_RUN] BUY skipped")
+            return
 
-        # 2) 기존 TP/SL 주문 취소
-        self._cancel_tp_orders(symbol)
+        # 1. 마진 모드 & 레버리지
+        self._set_isolated(market_id)
+        self._set_leverage(market_id)
 
-        # 3) 숏 포지션 전량 청산
-        pos_amt = self._fetch_position_amount(symbol)
+        # 2. 기존 TP/SL 취소
+        self._cancel_tp_sl(market_id)
+
+        # 3. 숏 포지션 청산 (if any)
+        pos = self.exchange.fetch_positions([SYMBOL])[0]
+        pos_amt = float(pos["info"]["positionAmt"])
         if pos_amt < 0:
-            close_short = self.exchange.create_market_buy_order(symbol, abs(pos_amt))
-            results["close_short"] = close_short
-            logger.info(f"Closed short: qty={abs(pos_amt)}")
+            close = self.exchange.create_market_buy_order(SYMBOL, abs(pos_amt))
+            logger.info(f"[CloseShort] qty={abs(pos_amt)}")
 
-        # 4) 이미 롱이면 건너뛰기
-        pos_amt = self._fetch_position_amount(symbol)
-        if pos_amt > 0:
-            logger.info("Already long, skipping new buy")
-            return results
+        # 4. 이미 롱이면 스킵
+        pos_now = float(self.exchange.fetch_positions([SYMBOL])[0]["info"]["positionAmt"])
+        if pos_now > 0:
+            logger.info("[Skip] Already long")
+            return
 
-        # 5) 시장가 롱 진입 (잔고의 98% 사용)
-        buy_qty_usdt = self._calc_buy_amount()
-        order = self.exchange.create_order(
-            symbol, "market", "buy",
-            None, None,
-            {"quoteOrderQty": buy_qty_usdt}
-        )
-        filled_qty  = float(order.get("filled", order.get("amount", 0)))
+        # 5. 시장가 롱 진입 (잔고의 98%)
+        qty = self._calc_qty(SYMBOL)
+        order = self.exchange.create_market_buy_order(SYMBOL, qty)
+        filled = float(order.get("filled", order.get("amount", 0)))
         entry_price = float(order.get("average", order.get("price", 0)))
-        results["buy"] = order
-        logger.info(f"BUY executed: ${buy_qty_usdt} → qty={filled_qty}@{entry_price}")
+        logger.info(f"[BUY] qty={filled}@{entry_price}")
 
-        # 6) 1차 익절 리밋 주문
-        tp_qty   = filled_qty * TP_PART_RATIO
+        # 6. 익절 리밋 주문 (50%)
+        tp_qty = filled * TP_PART_RATIO
         tp_price = entry_price * TP_RATIO
-        tp_order = self.exchange.create_limit_sell_order(
-            symbol, tp_qty, tp_price, {"reduceOnly": True}
-        )
-        results["tp"] = tp_order
-        logger.info(f"TP order: qty={tp_qty}@{tp_price}")
+        tp = self.exchange.create_limit_sell_order(SYMBOL, tp_qty, tp_price, {"reduceOnly": True})
+        logger.info(f"[TP] qty={tp_qty}@{tp_price}")
 
-        # 7) 손절 주문
+        # 7. 손절 스톱마켓 주문 (전량)
         sl_price = entry_price * SL_RATIO
-        sl_order = self.exchange.create_order(
-            symbol, "STOP_MARKET", "sell", filled_qty, None,
+        sl = self.exchange.create_order(
+            SYMBOL,
+            "STOP_MARKET",
+            "sell",
+            filled,
+            None,
             {"stopPrice": sl_price, "reduceOnly": True}
         )
-        results["sl"] = sl_order
-        logger.info(f"SL order: qty={filled_qty}@{sl_price}")
+        logger.info(f"[SL] qty={filled}@{sl_price}")
 
-        return results
+    def sell(self):
+        """ETH/USDT 숏 진입 + TP/SL"""
+        market_id = SYMBOL.replace("/", "")
+        if DRY_RUN:
+            logger.info("[DRY_RUN] SELL skipped")
+            return
 
-    def sell(self, symbol: str):
-        results = {}
+        # 1. 마진 모드 & 레버리지
+        self._set_isolated(market_id)
+        self._set_leverage(market_id)
 
-        # 1) 레버리지 설정
-        self.exchange.set_leverage(TRADE_LEVERAGE, symbol)
+        # 2. 기존 TP/SL 취소
+        self._cancel_tp_sl(market_id)
 
-        # 2) 기존 TP/SL 주문 취소
-        self._cancel_tp_orders(symbol)
-
-        # 3) 롱 포지션 전량 청산
-        pos_amt = self._fetch_position_amount(symbol)
+        # 3. 롱 포지션 청산 (if any)
+        pos = self.exchange.fetch_positions([SYMBOL])[0]
+        pos_amt = float(pos["info"]["positionAmt"])
         if pos_amt > 0:
-            close_long = self.exchange.create_market_sell_order(symbol, pos_amt)
-            results["close_long"] = close_long
-            logger.info(f"Closed long: qty={pos_amt}")
+            close = self.exchange.create_market_sell_order(SYMBOL, pos_amt)
+            logger.info(f"[CloseLong] qty={pos_amt}")
 
-        # 4) 이미 숏이면 건너뛰기
-        pos_amt = self._fetch_position_amount(symbol)
-        if pos_amt < 0:
-            logger.info("Already short, skipping new short")
-            return results
+        # 4. 이미 숏이면 스킵
+        pos_now = float(self.exchange.fetch_positions([SYMBOL])[0]["info"]["positionAmt"])
+        if pos_now < 0:
+            logger.info("[Skip] Already short")
+            return
 
-        # 5) 시장가 숏 진입 (잔고의 98% 사용)
-        sell_qty_usdt = self._calc_buy_amount()
-        order = self.exchange.create_order(
-            symbol, "market", "sell",
-            None, None,
-            {"quoteOrderQty": sell_qty_usdt}
-        )
-        filled_qty  = float(order.get("filled", order.get("amount", 0)))
+        # 5. 시장가 숏 진입 (잔고의 98%)
+        qty = self._calc_qty(SYMBOL)
+        order = self.exchange.create_market_sell_order(SYMBOL, qty)
+        filled = float(order.get("filled", order.get("amount", 0)))
         entry_price = float(order.get("average", order.get("price", 0)))
-        results["short"] = order
-        logger.info(f"SHORT executed: ${sell_qty_usdt} → qty={filled_qty}@{entry_price}")
+        logger.info(f"[SELL] qty={filled}@{entry_price}")
 
-        # 6) 숏 TP 주문
-        tp_qty   = filled_qty * TP_PART_RATIO
+        # 6. 익절 리밋 주문
+        tp_qty = filled * TP_PART_RATIO
         tp_price = entry_price / TP_RATIO
-        tp_order = self.exchange.create_limit_buy_order(
-            symbol, tp_qty, tp_price, {"reduceOnly": True}
-        )
-        results["tp"] = tp_order
-        logger.info(f"SHORT TP order: qty={tp_qty}@{tp_price}")
+        tp = self.exchange.create_limit_buy_order(SYMBOL, tp_qty, tp_price, {"reduceOnly": True})
+        logger.info(f"[TP] qty={tp_qty}@{tp_price}")
 
-        # 7) 숏 SL 주문
+        # 7. 손절 스톱마켓 주문
         sl_price = entry_price / SL_RATIO
-        sl_order = self.exchange.create_order(
-            symbol, "STOP_MARKET", "buy", filled_qty, None,
+        sl = self.exchange.create_order(
+            SYMBOL,
+            "STOP_MARKET",
+            "buy",
+            filled,
+            None,
             {"stopPrice": sl_price, "reduceOnly": True}
         )
-        results["sl"] = sl_order
-        logger.info(f"SHORT SL order: qty={filled_qty}@{sl_price}")
-
-        return results
+        logger.info(f"[SL] qty={filled}@{sl_price}")
