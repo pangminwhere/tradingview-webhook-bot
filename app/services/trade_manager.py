@@ -7,10 +7,10 @@ logger = logging.getLogger("trade_manager")
 
 # 거래 파라미터
 TRADE_AMOUNT    = 50       # USDT
-TRADE_LEVERAGE  = 10       # 10배 레버리지
-TP_RATIO        = 1.01     # +1% 익절
+TRADE_LEVERAGE  = 1       # 10배 레버리지
+TP_RATIO        = 1.005     # +0.5% 익절
 TP_PART_RATIO   = 0.5      # 50% 익절
-SL_RATIO        = 0.98     # -2% 손절 (진입가 * 0.98)
+SL_RATIO        = 0.995     # -0.5% 손절 (진입가 * 0.98)
 
 class TradeManager:
     def __init__(self, api_key: str, secret: str):
