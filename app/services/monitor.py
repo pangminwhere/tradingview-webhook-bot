@@ -1,5 +1,4 @@
 # app/services/monitor.py
-
 import threading
 import time
 import logging
@@ -16,8 +15,8 @@ logger.setLevel(logging.INFO)
 
 def _handle_order_update(msg):
     # ORDER_TRADE_UPDATE 이벤트 수신
+    o = msg.get("o", {})
     if msg.get("e") == "ORDER_TRADE_UPDATE":
-        o = msg["o"]
         # 마켓 BUY 체결
         if o.get("X") == "FILLED" and o.get("S") == "BUY" and o.get("o") == "MARKET":
             price = float(o.get("L", 0))
@@ -34,15 +33,13 @@ def _handle_order_update(msg):
             })
             logger.info(f"Entry detected: {qty}@{price} at {now}")
 
-
 def _poll_price_loop():
     client = get_binance_client()
     symbol = monitor_state["symbol"]
 
     while True:
-        qty   = monitor_state["position_qty"]
+        qty = monitor_state["position_qty"]
         entry = monitor_state["entry_price"]
-
         if qty > 0 and entry > 0:
             # 현재가 조회
             current = float(client.futures_symbol_ticker(symbol=symbol)["price"])
@@ -67,7 +64,7 @@ def _poll_price_loop():
                     "position_qty": qty - tp_qty
                 })
                 logger.info(f"1차 익절: {tp_qty}@{current} ({tp_pnl:.2f}% at {now})")
-
+                
             # 2차 TP (1.1%): 50%
             elif monitor_state["first_tp_done"] and not monitor_state["second_tp_done"] and current >= entry * 1.011:
                 tp_qty2 = monitor_state["position_qty"] * 0.5
@@ -85,10 +82,10 @@ def _poll_price_loop():
                     "position_qty": monitor_state["position_qty"] - tp_qty2
                 })
                 logger.info(f"2차 익절: {tp_qty2}@{current} ({tp_pnl2:.2f}% at {now})")
-
+                
             # SL: -0.5% or +0.1% after 1차
-            sl_thresh = entry * (1.001 if monitor_state["first_tp_done"] else 0.995)
-            if not monitor_state["sl_done"] and current <= sl_thresh:
+            sl_price_thresh = entry * (1.001 if monitor_state["first_tp_done"] else 0.995)
+            if not monitor_state["sl_done"] and current <= sl_price_thresh:
                 sl_qty = monitor_state["position_qty"]
                 client.futures_create_order(
                     symbol=symbol,
@@ -106,8 +103,7 @@ def _poll_price_loop():
                 logger.info(f"손절 실행: {sl_qty}@{current} ({sl_pnl:.2f}% at {now})")
 
         time.sleep(POLL_INTERVAL)
-
-
+        
 def start_monitor():
     client = get_binance_client()
     twm = ThreadedWebsocketManager(
