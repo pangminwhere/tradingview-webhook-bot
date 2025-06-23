@@ -61,14 +61,14 @@ def _poll_price_loop():
         time.sleep(3)
         
 def start_monitor():
-    # 1) Websocket 유저 스트림 시작
     client = get_binance_client()
+    
     twm = ThreadedWebsocketManager(
         api_key=client.API_KEY,
-        api_secret=client.API_SECRET,
-        futures=True
+        api_secret=client.API_SECRET
     )
     twm.start()
+    # user data(주문 체결) 스트림 구독
     twm.start_user_socket(callback=_handle_order_update)
 
     # 2) 폴링 스레드 시작
