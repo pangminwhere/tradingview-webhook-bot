@@ -1,10 +1,12 @@
+# app/routers/webhook.py
+
 import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.config import DRY_RUN
-from app.services.trade_manager import TradeManager
+from app.services.switching import switch_position
 from app.state import last_trade
 
 logger = logging.getLogger("webhook")
@@ -18,40 +20,35 @@ class AlertPayload(BaseModel):
 
 @router.post("/webhook")
 async def webhook(payload: AlertPayload):
-    sym    = payload.symbol.upper()
+    # "ETH/USDT" → "ETHUSDT"
+    sym    = payload.symbol.replace("/", "").upper()
     action = payload.action.upper()
-    tm     = TradeManager()     # 실제 모드: testnet=False 이므로 인자 없이 생성
 
-    # Dry-run 모드면 주문 없이 로그만 찍고 리턴
+    # Dry-run 모드면 주문 없이 로깅만
     if DRY_RUN:
         logger.info(f"[DRY_RUN] {action} {sym}")
         return {"status": "dry_run"}
 
     try:
-        if action == "BUY":
-            res = tm.buy()
-            # 체결된 매수 주문에서 진입가 추출
-            buy_order   = res.get("buy", {})
-            entry_price = float(buy_order.get("average", buy_order.get("price", 0)))
+        # 스위칭 로직 (기존 포지션 청산 후 반대 포지션 진입)
+        res = switch_position(sym, action)
+
+        # 체결된 주문에서 entry price 추출
+        if "buy" in res:
+            entry_price = float(res["buy"]["entry"])
             last_trade.update({
                 "symbol": sym,
                 "side":   "long",
                 "entry":  entry_price
             })
-
-        elif action == "SELL":
-            res = tm.sell()
-            # 체결된 매도 주문에서 진입가(숏 진입가) 추출
-            sell_order  = res.get("sell", {})
-            entry_price = float(sell_order.get("average", sell_order.get("price", 0)))
+        elif "sell" in res:
+            entry_price = float(res["sell"]["entry"])
             last_trade.update({
                 "symbol": sym,
                 "side":   "short",
                 "entry":  entry_price
             })
-
-        else:
-            raise HTTPException(status_code=400, detail="Unknown action")
+        # else: skipped case, 그대로 리턴
 
     except Exception as e:
         # 예외 스택 트레이스까지 로그로 남기기
