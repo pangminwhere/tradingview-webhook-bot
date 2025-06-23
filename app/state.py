@@ -35,4 +35,12 @@ monitor_state = {
     # 현재가 & PnL
     "current_price": 0.0,
     "pnl": 0.0,
+    
+    # —— 아래가 새로 추가된 일일 정산용 카운터들 ——  
+    "trade_count": 0,       # 신호 받을 때마다 +1  
+    "first_tp_count": 0,    # 1차 익절 시 +1  
+    "second_tp_count": 0,   # 2차 익절 시 +1  
+    "sl_count": 0,          # 손절 시 +1  
+    "daily_pnl": 0.0,       # 모든 익절/손절 PnL 합산(%)  
+    "last_reset": ""        # 마지막 리셋 일자(YYYY-MM-DD)  
 }

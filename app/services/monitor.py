@@ -1,4 +1,5 @@
 # app/services/monitor.py
+
 import threading
 import time
 import logging
@@ -33,13 +34,15 @@ def _handle_order_update(msg):
             })
             logger.info(f"Entry detected: {qty}@{price} at {now}")
 
+
 def _poll_price_loop():
     client = get_binance_client()
     symbol = monitor_state["symbol"]
 
     while True:
-        qty = monitor_state["position_qty"]
+        qty   = monitor_state["position_qty"]
         entry = monitor_state["entry_price"]
+
         if qty > 0 and entry > 0:
             # 현재가 조회
             current = float(client.futures_symbol_ticker(symbol=symbol)["price"])
@@ -56,15 +59,18 @@ def _poll_price_loop():
                 )
                 tp_pnl = (current / entry - 1) * 100
                 monitor_state.update({
-                    "first_tp_done": True,
+                    "first_tp_done":  True,
                     "first_tp_price": current,
-                    "first_tp_qty": tp_qty,
-                    "first_tp_time": now,
-                    "first_tp_pnl": tp_pnl,
-                    "position_qty": qty - tp_qty
+                    "first_tp_qty":   tp_qty,
+                    "first_tp_time":  now,
+                    "first_tp_pnl":   tp_pnl,
+                    "position_qty":   qty - tp_qty
                 })
+                # 1차 익절 카운터 + PnL 누적
+                monitor_state["first_tp_count"] += 1
+                monitor_state["daily_pnl"]     += tp_pnl
                 logger.info(f"1차 익절: {tp_qty}@{current} ({tp_pnl:.2f}% at {now})")
-                
+
             # 2차 TP (1.1%): 50%
             elif monitor_state["first_tp_done"] and not monitor_state["second_tp_done"] and current >= entry * 1.011:
                 tp_qty2 = monitor_state["position_qty"] * 0.5
@@ -74,15 +80,18 @@ def _poll_price_loop():
                 )
                 tp_pnl2 = (current / entry - 1) * 100
                 monitor_state.update({
-                    "second_tp_done": True,
+                    "second_tp_done":  True,
                     "second_tp_price": current,
-                    "second_tp_qty": tp_qty2,
-                    "second_tp_time": now,
-                    "second_tp_pnl": tp_pnl2,
-                    "position_qty": monitor_state["position_qty"] - tp_qty2
+                    "second_tp_qty":   tp_qty2,
+                    "second_tp_time":  now,
+                    "second_tp_pnl":   tp_pnl2,
+                    "position_qty":    monitor_state["position_qty"] - tp_qty2
                 })
+                # 2차 익절 카운터 + PnL 누적
+                monitor_state["second_tp_count"] += 1
+                monitor_state["daily_pnl"]       += tp_pnl2
                 logger.info(f"2차 익절: {tp_qty2}@{current} ({tp_pnl2:.2f}% at {now})")
-                
+
             # SL: -0.5% or +0.1% after 1차
             sl_price_thresh = entry * (1.001 if monitor_state["first_tp_done"] else 0.995)
             if not monitor_state["sl_done"] and current <= sl_price_thresh:
@@ -93,17 +102,21 @@ def _poll_price_loop():
                 )
                 sl_pnl = (current / entry - 1) * 100
                 monitor_state.update({
-                    "sl_done": True,
-                    "sl_price": current,
-                    "sl_qty": sl_qty,
-                    "sl_time": now,
-                    "sl_pnl": sl_pnl,
-                    "position_qty": 0
+                    "sl_done":        True,
+                    "sl_price":       current,
+                    "sl_qty":         sl_qty,
+                    "sl_time":        now,
+                    "sl_pnl":         sl_pnl,
+                    "position_qty":   0
                 })
+                # SL 카운터 + PnL 누적
+                monitor_state["sl_count"]  += 1
+                monitor_state["daily_pnl"] += sl_pnl
                 logger.info(f"손절 실행: {sl_qty}@{current} ({sl_pnl:.2f}% at {now})")
 
         time.sleep(POLL_INTERVAL)
-        
+
+
 def start_monitor():
     client = get_binance_client()
     twm = ThreadedWebsocketManager(
