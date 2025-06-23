@@ -1,5 +1,3 @@
-# app/services/sell.py
-
 import logging
 import time
 import math
@@ -124,11 +122,17 @@ def execute_sell(symbol: str) -> dict:
         type=ORDER_TYPE_MARKET,
         quantity=str(qty)
     )
+    # 체결 확인
     if not _wait_for_position(symbol, -qty):
         return {"skipped": "open_failed"}
 
-    filled      = float(order["executedQty"])
-    entry_price = float(order["avgPrice"])
+    # 체결된 주문 정보 재조회
+    order_info = client.futures_get_order(
+        symbol=symbol,
+        orderId=order["orderId"]
+    )
+    filled      = float(order_info["executedQty"])
+    entry_price = float(order_info["avgPrice"])
     logger.info(f"SELL executed {filled}@{entry_price}")
 
     # 6) TP/SL 설정
