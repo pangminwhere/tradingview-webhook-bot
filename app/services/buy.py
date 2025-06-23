@@ -1,5 +1,9 @@
+# app/services/buy.py
+
 import logging
 import time
+import math
+from binance.exceptions import BinanceAPIException
 from binance.enums import (
     SIDE_BUY,
     ORDER_TYPE_MARKET,
@@ -94,9 +98,22 @@ def execute_buy(symbol: str) -> dict:
     usdt_bal = float(next(item["balance"] for item in bal_list if item["asset"] == "USDT"))
     alloc    = usdt_bal * BUY_PCT
     price    = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    qty      = round(alloc / price, 3)
+    raw_qty  = alloc / price
+    logger.info(f"Balance={usdt_bal}, alloc={alloc}, price={price}, raw_qty={raw_qty}")
 
-    if qty <= 0:
+    # 심볼별 최소 수량/스텝 조회
+    info     = client.futures_exchange_info()
+    sym_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
+    lot      = next(f for f in sym_info["filters"] if f["filterType"] == "LOT_SIZE")
+    step     = float(lot["stepSize"])
+    min_qty  = float(lot["minQty"])
+
+    # 스텝 단위로 내림
+    qty = math.floor(raw_qty / step) * step
+    logger.info(f"Rounded qty by step({step}): {qty}")
+
+    if qty < min_qty or qty <= 0:
+        logger.error(f"Calculated qty {qty} < minQty {min_qty}, skipping entry")
         return {"skipped": "calc_zero"}
 
     # 5) 시장가 롱 진입
@@ -104,7 +121,7 @@ def execute_buy(symbol: str) -> dict:
         symbol=symbol,
         side=SIDE_BUY,
         type=ORDER_TYPE_MARKET,
-        quantity=qty
+        quantity=str(qty)
     )
     if not _wait_for_position(symbol, qty):
         return {"skipped": "open_failed"}
@@ -113,27 +130,46 @@ def execute_buy(symbol: str) -> dict:
     entry_price = float(order["avgPrice"])
     logger.info(f"BUY executed {filled}@{entry_price}")
 
-    # 6) TP/SL 주문 설정
-    tp_qty   = round(filled * TP_PART_RATIO, 3)
+    # 6) TP/SL 설정
+    # TP: entry_price * TP_RATIO, 분할 매도
     tp_price = entry_price * TP_RATIO
-    sl_price = entry_price * SL_RATIO
+    tp_qty   = math.floor((filled * TP_PART_RATIO) / step) * step
 
-    client.futures_create_order(
-        symbol=symbol,
-        side="SELL",
-        type=ORDER_TYPE_LIMIT,
-        timeInForce=TIME_IN_FORCE_GTC,
-        quantity=tp_qty,
-        price=str(tp_price),
-        reduceOnly=True
-    )
-    client.futures_create_order(
-        symbol=symbol,
-        side="SELL",
-        type="STOP_MARKET",
-        stopPrice=str(sl_price),
-        quantity=filled,
-        reduceOnly=True
-    )
+    if tp_qty >= min_qty:
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side="SELL",
+                type=ORDER_TYPE_LIMIT,
+                timeInForce=TIME_IN_FORCE_GTC,
+                quantity=str(tp_qty),
+                price=str(tp_price),
+                reduceOnly=True
+            )
+            logger.info(f"Set TP: qty={tp_qty}, price={tp_price}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set TP order: {e}")
+    else:
+        logger.warning(f"TP qty {tp_qty} < minQty {min_qty}, skipping TP")
+
+    # SL: entry_price * SL_RATIO, 전체 청산
+    sl_price = entry_price * SL_RATIO
+    sl_qty   = filled
+
+    if sl_qty >= min_qty:
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side="SELL",
+                type="STOP_MARKET",
+                stopPrice=str(sl_price),
+                quantity=str(sl_qty),
+                reduceOnly=True
+            )
+            logger.info(f"Set SL: qty={sl_qty}, stopPrice={sl_price}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set SL order: {e}")
+    else:
+        logger.warning(f"SL qty {sl_qty} < minQty {min_qty}, skipping SL")
 
     return {"buy": {"filled": filled, "entry": entry_price}}
