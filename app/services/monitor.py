@@ -1,107 +1,127 @@
+# app/services/monitor.py
+
 import threading
 import time
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from binance import ThreadedWebsocketManager
 from app.clients.binance_client import get_binance_client
 from app.state import monitor_state
 from app.config import POLL_INTERVAL
 
+logger = logging.getLogger("monitor")
+logger.setLevel(logging.INFO)
+
 
 def _handle_order_update(msg):
-    """
-    User Data Stream 으로부터 주문 체결 이벤트를 수신합니다.
-    마켓 BUY 체결 시 entry_price, position_qty 초기화
-    """
+    # ORDER_TRADE_UPDATE 이벤트 수신
     if msg.get("e") == "ORDER_TRADE_UPDATE":
         o = msg["o"]
-        # 마켓 BUY 주문이 체결되면 entry 설정
+        # 마켓 BUY 체결
         if o.get("X") == "FILLED" and o.get("S") == "BUY" and o.get("o") == "MARKET":
-            monitor_state["entry_price"]   = float(o["L"])  # 체결 평균가
-            monitor_state["position_qty"]  = float(o["q"])  # 체결 수량
-            monitor_state["first_tp_done"]  = False
-            monitor_state["second_tp_done"] = False
+            price = float(o.get("L", 0))
+            qty   = float(o.get("q", 0))
+            now   = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+            monitor_state.update({
+                "entry_price": price,
+                "position_qty": qty,
+                "entry_time": now,
+                # reset TP/SL
+                "first_tp_done": False,
+                "second_tp_done": False,
+                "sl_done": False
+            })
+            logger.info(f"Entry detected: {qty}@{price} at {now}")
 
 
 def _poll_price_loop():
-    """
-    3초마다 현재가를 폴링하며 PnL을 계산하고,
-    지정된 수익/손절 조건에 맞춰 시장가 청산을 실행합니다.
-    """
     client = get_binance_client()
     symbol = monitor_state["symbol"]
 
     while True:
-        qty = monitor_state["position_qty"]
-        if qty > 0:
+        qty   = monitor_state["position_qty"]
+        entry = monitor_state["entry_price"]
+
+        if qty > 0 and entry > 0:
             # 현재가 조회
-            ticker = client.futures_symbol_ticker(symbol=symbol)
-            current = float(ticker["price"])
-            entry   = monitor_state["entry_price"]
+            current = float(client.futures_symbol_ticker(symbol=symbol)["price"])
+            now     = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
             monitor_state["current_price"] = current
-            monitor_state["pnl"]           = (current / entry - 1) * 100
+            monitor_state["pnl"] = (current / entry - 1) * 100
 
-            # 1차 익절: +0.5%, 30%
+            # 1차 TP (0.5%): 30%
             if not monitor_state["first_tp_done"] and current >= entry * 1.005:
+                tp_qty = qty * 0.3
                 client.futures_create_order(
                     symbol=symbol,
-                    side="SELL",
-                    type="MARKET",
-                    quantity=qty * 0.3
+                    side='SELL', type='MARKET', quantity=tp_qty
                 )
-                monitor_state["position_qty"]  -= qty * 0.3
-                monitor_state["first_tp_done"]  = True
+                tp_pnl = (current / entry - 1) * 100
+                monitor_state.update({
+                    "first_tp_done": True,
+                    "first_tp_price": current,
+                    "first_tp_qty": tp_qty,
+                    "first_tp_time": now,
+                    "first_tp_pnl": tp_pnl,
+                    "position_qty": qty - tp_qty
+                })
+                logger.info(f"1차 익절: {tp_qty}@{current} ({tp_pnl:.2f}% at {now})")
 
-            # 2차 익절: +1.1%, 50%
+            # 2차 TP (1.1%): 50%
             elif monitor_state["first_tp_done"] and not monitor_state["second_tp_done"] and current >= entry * 1.011:
+                tp_qty2 = monitor_state["position_qty"] * 0.5
                 client.futures_create_order(
                     symbol=symbol,
-                    side="SELL",
-                    type="MARKET",
-                    quantity=qty * 0.5
+                    side='SELL', type='MARKET', quantity=tp_qty2
                 )
-                monitor_state["position_qty"]   -= qty * 0.5
-                monitor_state["second_tp_done"]  = True
+                tp_pnl2 = (current / entry - 1) * 100
+                monitor_state.update({
+                    "second_tp_done": True,
+                    "second_tp_price": current,
+                    "second_tp_qty": tp_qty2,
+                    "second_tp_time": now,
+                    "second_tp_pnl": tp_pnl2,
+                    "position_qty": monitor_state["position_qty"] - tp_qty2
+                })
+                logger.info(f"2차 익절: {tp_qty2}@{current} ({tp_pnl2:.2f}% at {now})")
 
-            # 손절: -0.5% 또는 1차 익절 후 +0.1%
+            # SL: -0.5% or +0.1% after 1차
             sl_thresh = entry * (1.001 if monitor_state["first_tp_done"] else 0.995)
-            if current <= sl_thresh and monitor_state["position_qty"] > 0:
+            if not monitor_state["sl_done"] and current <= sl_thresh:
+                sl_qty = monitor_state["position_qty"]
                 client.futures_create_order(
                     symbol=symbol,
-                    side="SELL",
-                    type="MARKET",
-                    quantity=monitor_state["position_qty"]
+                    side='SELL', type='MARKET', quantity=sl_qty
                 )
-                monitor_state["position_qty"] = 0
+                sl_pnl = (current / entry - 1) * 100
+                monitor_state.update({
+                    "sl_done": True,
+                    "sl_price": current,
+                    "sl_qty": sl_qty,
+                    "sl_time": now,
+                    "sl_pnl": sl_pnl,
+                    "position_qty": 0
+                })
+                logger.info(f"손절 실행: {sl_qty}@{current} ({sl_pnl:.2f}% at {now})")
 
-        time.sleep(3)
+        time.sleep(POLL_INTERVAL)
 
 
 def start_monitor():
-    """
-    WebsocketManager와 폴링 스레드를 띄웁니다.
-    초기화 예외는 잡아서 로그만 남기고 조용히 종료합니다.
-    """
     client = get_binance_client()
     twm = ThreadedWebsocketManager(
         api_key=client.API_KEY,
         api_secret=client.API_SECRET
     )
-
-    # Websocket 초기화
     try:
         twm.start()
-        # 선물 유저 데이터 스트림 구독
         twm.start_futures_user_socket(callback=_handle_order_update)
+        logger.info("WebsocketManager initialized")
     except Exception:
-        logging.getLogger("monitor").exception("WebsocketManager 초기화 실패")
+        logger.exception("WebsocketManager 초기화 실패")
         return
 
-    # 폴링 스레드 안전 실행
-    def poll_safe():
-        try:
-            _poll_price_loop()
-        except Exception:
-            logging.getLogger("monitor").exception("가격 폴링 실패")
-
-    thread = threading.Thread(target=poll_safe, daemon=True)
+    thread = threading.Thread(target=_poll_price_loop, daemon=True)
     thread.start()
+    logger.info("Price polling thread started")

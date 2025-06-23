@@ -1,21 +1,38 @@
 # app/state.py
 
-# 가장 최근 체결된 포지션 정보를 간단히 저장
-last_trade = {
-    "symbol": None,   # ex: "ETH/USDT"
-    "side":   None,   # "long" or "short"
-    "entry":  0.0     # 진입 평균가
-}
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# app/state.py
-
-# 기존 last_trade 외에 아래 추가
 monitor_state = {
-    "symbol": "ETHUSDT",       # 모니터링 심볼
+    "symbol": "ETHUSDT",
+
+    # 진입 정보
     "entry_price": 0.0,
     "position_qty": 0.0,
-    "current_price": 0.0,
-    "pnl": 0.0,                 # % 수익률
+    "entry_time": "",
+
+    # 1차 익절 정보
     "first_tp_done": False,
+    "first_tp_price": 0.0,
+    "first_tp_qty": 0.0,
+    "first_tp_time": "",
+    "first_tp_pnl": 0.0,
+
+    # 2차 익절 정보
     "second_tp_done": False,
+    "second_tp_price": 0.0,
+    "second_tp_qty": 0.0,
+    "second_tp_time": "",
+    "second_tp_pnl": 0.0,
+
+    # 손절 정보
+    "sl_done": False,
+    "sl_price": 0.0,
+    "sl_qty": 0.0,
+    "sl_time": "",
+    "sl_pnl": 0.0,
+
+    # 현재가 & PnL
+    "current_price": 0.0,
+    "pnl": 0.0,
 }
