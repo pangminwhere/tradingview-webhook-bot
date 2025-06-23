@@ -69,7 +69,7 @@ def start_monitor():
     )
     twm.start()
     # user data(주문 체결) 스트림 구독
-    twm.start_user_socket(callback=_handle_order_update)
+    twm.start_futures_user_socket(callback=_handle_order_update)
 
     # 2) 폴링 스레드 시작
     thread = threading.Thread(target=_poll_price_loop, daemon=True)
