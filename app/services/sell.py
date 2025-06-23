@@ -7,7 +7,6 @@ from binance.enums import (
     SIDE_BUY,
     ORDER_TYPE_MARKET,
     ORDER_TYPE_LIMIT,
-    ORDER_TYPE_STOP_MARKET,
     TIME_IN_FORCE_GTC,
 )
 from app.clients.binance_client import get_binance_client
@@ -144,7 +143,7 @@ def execute_sell(symbol: str) -> dict:
     client.futures_create_order(
         symbol=symbol,
         side=SIDE_BUY,
-        type=ORDER_TYPE_STOP_MARKET,
+        type="STOP_MARKET",
         stopPrice=str(sl_price),
         quantity=filled,
         reduceOnly=True
