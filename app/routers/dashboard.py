@@ -46,4 +46,19 @@ async def dashboard():
             <h2>진입 정보 ({'진행 중' if qty > 0 else '미진행'})</h2>
             <p><strong>진입가:</strong> {entry_price:.2f} USDT</p>
             <p><strong>현재 수량:</strong> {qty:.4f}</p>
+            </div>
+
+        <div class="section">
+            <h2>1차 익절 ({'완료' if first_done else '미완료'})</h2>
+            <p><strong>목표가 (+0.5%):</strong> {tp1_target:.2f} USDT</p>
+        </div>
+
+        <div class="section">
+            <h2>2차 익절 ({'완료' if second_done else '미완료'})</h2>
+            <p><strong>목표가 (+1.1%):</strong> {tp2_target:.2f} USDT</p>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html_content)
 """
