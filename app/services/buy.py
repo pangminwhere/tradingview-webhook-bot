@@ -6,7 +6,6 @@ from binance.enums import (
     SIDE_BUY,
     SIDE_SELL,
     ORDER_TYPE_MARKET,
-    ORDER_TYPE_TAKE_PROFIT_MARKET,
 )
 from app.clients.binance_client import get_binance_client
 from app.config import (
@@ -130,7 +129,7 @@ def execute_buy(symbol: str) -> dict:
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_SELL,
-                type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+                type="TAKE_PROFIT_MARKET",
                 stopPrice=str(tp_price_1),
                 quantity=str(tp_qty_1),
                 reduceOnly=True
@@ -148,7 +147,7 @@ def execute_buy(symbol: str) -> dict:
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_SELL,
-                type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+                type="TAKE_PROFIT_MARKET",
                 stopPrice=str(tp_price_2),
                 quantity=str(tp_qty_2),
                 reduceOnly=True
