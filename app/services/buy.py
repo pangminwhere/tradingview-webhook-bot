@@ -1,7 +1,9 @@
+# app/services/buy.py
+
 import logging
 import time
 import math
-import decimal
+from decimal import Decimal, ROUND_DOWN
 from binance.exceptions import BinanceAPIException
 from binance.enums import (
     SIDE_BUY,
@@ -25,9 +27,17 @@ from app.config import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-def get_precision(size_str: str) -> int:
-    """StepSize 또는 TickSize에서 소수점 precision을 구함"""
-    return abs(decimal.Decimal(size_str).as_tuple().exponent)
+
+def adjust_to_step_size(value, step_size):
+    """
+    step_size: 예) 0.001
+    value: float
+    """
+    step_dec = Decimal(str(step_size))
+    precision = abs(step_dec.as_tuple().exponent)
+    quantize_str = '1.' + '0' * precision
+    return float(Decimal(str(value)).quantize(Decimal(quantize_str), rounding=ROUND_DOWN))
+
 
 def _wait_for_position(symbol: str, target_amt: float) -> bool:
     client = get_binance_client()
@@ -51,7 +61,13 @@ def _wait_for_position(symbol: str, target_amt: float) -> bool:
     logger.warning(f"Timeout: target {target_amt}, current {current}")
     return False
 
+
 def execute_buy(symbol: str) -> dict:
+    """
+    symbol 예: "ETHUSDT"
+    롱 진입 → TP/SL 설정
+    반환: {"buy": {"filled": x, "entry": y}} 또는 {"skipped": reason}
+    """
     client = get_binance_client()
 
     if DRY_RUN:
@@ -79,6 +95,7 @@ def execute_buy(symbol: str) -> dict:
         return {"skipped": "already_long"}
 
     if current_amt < 0:
+        # 숏 포지션 청산
         client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
@@ -97,20 +114,16 @@ def execute_buy(symbol: str) -> dict:
     raw_qty = alloc / price
     logger.info(f"Balance={usdt_bal}, alloc={alloc}, price={price}, raw_qty={raw_qty}")
 
-    # Precision 처리
+    # 심볼별 최소 수량/스텝 조회
     info = client.futures_exchange_info()
     sym_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
     lot = next(f for f in sym_info["filters"] if f["filterType"] == "LOT_SIZE")
-    step = lot["stepSize"]
+    step = float(lot["stepSize"])
     min_qty = float(lot["minQty"])
-    qty_precision = get_precision(step)
 
-    price_filter = next(f for f in sym_info["filters"] if f["filterType"] == "PRICE_FILTER")
-    tick_size = price_filter["tickSize"]
-    price_precision = get_precision(tick_size)
-
-    qty = math.floor(raw_qty / float(step)) * float(step)
-    qty = round(qty, qty_precision)
+    # 스텝 단위로 조정
+    qty = adjust_to_step_size(raw_qty, step)
+    logger.info(f"Adjusted qty by step({step}): {qty}")
 
     if qty < min_qty or qty <= 0:
         logger.error(f"Calculated qty {qty} < minQty {min_qty}, skipping entry")
@@ -123,9 +136,11 @@ def execute_buy(symbol: str) -> dict:
         type=ORDER_TYPE_MARKET,
         quantity=str(qty)
     )
+
     if not _wait_for_position(symbol, qty):
         return {"skipped": "open_failed"}
 
+    # 체결된 주문 정보 재조회
     order_info = client.futures_get_order(
         symbol=symbol,
         orderId=order["orderId"]
@@ -135,36 +150,57 @@ def execute_buy(symbol: str) -> dict:
     logger.info(f"BUY executed {filled}@{entry_price}")
 
     # 6) TP/SL 설정
-    tp_price = round(entry_price * TP_RATIO, price_precision)
-    tp_qty = math.floor((filled * TP_PART_RATIO) / float(step)) * float(step)
-    tp_qty = round(tp_qty, qty_precision)
-
-    sl_price = round(entry_price * SL_RATIO, price_precision)
-    sl_qty = filled
-    sl_qty = round(sl_qty, qty_precision)
+    # 1차 TP: entry_price * TP_RATIO, 원 물량의 30%
+    tp_price = entry_price * TP_RATIO
+    tp_qty = adjust_to_step_size(filled * TP_PART_RATIO, step)
 
     if tp_qty >= min_qty:
         try:
             client.futures_create_order(
                 symbol=symbol,
-                side="SELL",
+                side=SIDE_SELL,
                 type=ORDER_TYPE_LIMIT,
                 timeInForce=TIME_IN_FORCE_GTC,
                 quantity=str(tp_qty),
                 price=str(tp_price),
                 reduceOnly=True
             )
-            logger.info(f"Set TP: qty={tp_qty}, price={tp_price}")
+            logger.info(f"Set 1st TP: qty={tp_qty}, price={tp_price}")
         except BinanceAPIException as e:
-            logger.error(f"Failed to set TP order: {e}")
+            logger.error(f"Failed to set 1st TP order: {e}")
     else:
         logger.warning(f"TP qty {tp_qty} < minQty {min_qty}, skipping TP")
+
+    # 2차 TP: entry_price * 1.011, 현재 남은 물량의 50% (0.7 * 0.5 = 0.35)
+    tp_price_2 = entry_price * 1.011
+    tp_qty_2 = adjust_to_step_size(filled * 0.7 * 0.5, step)
+
+    if tp_qty_2 >= min_qty:
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type=ORDER_TYPE_LIMIT,
+                timeInForce=TIME_IN_FORCE_GTC,
+                quantity=str(tp_qty_2),
+                price=str(tp_price_2),
+                reduceOnly=True
+            )
+            logger.info(f"Set 2nd TP: qty={tp_qty_2}, price={tp_price_2}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set 2nd TP order: {e}")
+    else:
+        logger.warning(f"2nd TP qty {tp_qty_2} < minQty {min_qty}, skipping 2nd TP")
+
+    # SL: entry_price * SL_RATIO, 전체 청산
+    sl_price = entry_price * SL_RATIO
+    sl_qty = adjust_to_step_size(filled, step)
 
     if sl_qty >= min_qty:
         try:
             client.futures_create_order(
                 symbol=symbol,
-                side="SELL",
+                side=SIDE_SELL,
                 type="STOP_MARKET",
                 stopPrice=str(sl_price),
                 quantity=str(sl_qty),
