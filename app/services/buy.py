@@ -1,11 +1,14 @@
 import logging
 import time
 import math
+import decimal
 from binance.exceptions import BinanceAPIException
 from binance.enums import (
     SIDE_BUY,
     SIDE_SELL,
     ORDER_TYPE_MARKET,
+    ORDER_TYPE_LIMIT,
+    TIME_IN_FORCE_GTC,
 )
 from app.clients.binance_client import get_binance_client
 from app.config import (
@@ -21,6 +24,10 @@ from app.config import (
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+def get_precision(size_str: str) -> int:
+    """StepSize 또는 TickSize에서 소수점 precision을 구함"""
+    return abs(decimal.Decimal(size_str).as_tuple().exponent)
 
 def _wait_for_position(symbol: str, target_amt: float) -> bool:
     client = get_binance_client()
@@ -61,7 +68,7 @@ def execute_buy(symbol: str) -> dict:
             client.futures_cancel_order(symbol=symbol, orderId=order["orderId"])
             logger.info(f"Canceled TP/SL order {order['orderId']}")
 
-    # 3) 기존 포지션 체크 및 청산
+    # 3) 기존 포지션 체크
     positions = client.futures_position_information(symbol=symbol)
     current_amt = next(
         (float(p["positionAmt"]) for p in positions if p["symbol"] == symbol),
@@ -88,87 +95,85 @@ def execute_buy(symbol: str) -> dict:
     alloc = usdt_bal * BUY_PCT
     price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
     raw_qty = alloc / price
+    logger.info(f"Balance={usdt_bal}, alloc={alloc}, price={price}, raw_qty={raw_qty}")
 
+    # Precision 처리
     info = client.futures_exchange_info()
     sym_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
     lot = next(f for f in sym_info["filters"] if f["filterType"] == "LOT_SIZE")
-    step = float(lot["stepSize"])
+    step = lot["stepSize"]
     min_qty = float(lot["minQty"])
+    qty_precision = get_precision(step)
 
-    qty = math.floor(raw_qty / step) * step
-    logger.info(f"Balance={usdt_bal}, alloc={alloc}, price={price}, qty={qty}")
+    price_filter = next(f for f in sym_info["filters"] if f["filterType"] == "PRICE_FILTER")
+    tick_size = price_filter["tickSize"]
+    price_precision = get_precision(tick_size)
+
+    qty = math.floor(raw_qty / float(step)) * float(step)
+    qty = round(qty, qty_precision)
 
     if qty < min_qty or qty <= 0:
         logger.error(f"Calculated qty {qty} < minQty {min_qty}, skipping entry")
         return {"skipped": "calc_zero"}
 
-    # 5) 시장가 매수 진입
+    # 5) 시장가 롱 진입
     order = client.futures_create_order(
         symbol=symbol,
         side=SIDE_BUY,
         type=ORDER_TYPE_MARKET,
         quantity=str(qty)
     )
-
     if not _wait_for_position(symbol, qty):
         return {"skipped": "open_failed"}
 
-    order_info = client.futures_get_order(symbol=symbol, orderId=order["orderId"])
+    order_info = client.futures_get_order(
+        symbol=symbol,
+        orderId=order["orderId"]
+    )
     filled = float(order_info["executedQty"])
     entry_price = float(order_info["avgPrice"])
     logger.info(f"BUY executed {filled}@{entry_price}")
 
-    # 6) TP/SL 설정 (TP: 1차 원 물량의 30%, 2차 잔량의 50% / SL 전체 청산)
+    # 6) TP/SL 설정
+    tp_price = round(entry_price * TP_RATIO, price_precision)
+    tp_qty = math.floor((filled * TP_PART_RATIO) / float(step)) * float(step)
+    tp_qty = round(tp_qty, qty_precision)
 
-    try:
-        # 1차 TP: entry_price * 1.005, 원 물량의 30%
-        tp_price_1 = round(entry_price * 1.005, 2)
-        tp_qty_1 = math.floor((filled * 0.3) / step) * step
+    sl_price = round(entry_price * SL_RATIO, price_precision)
+    sl_qty = filled
+    sl_qty = round(sl_qty, qty_precision)
 
-        if tp_qty_1 >= min_qty:
+    if tp_qty >= min_qty:
+        try:
             client.futures_create_order(
                 symbol=symbol,
-                side=SIDE_SELL,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=str(tp_price_1),
-                quantity=str(tp_qty_1),
+                side="SELL",
+                type=ORDER_TYPE_LIMIT,
+                timeInForce=TIME_IN_FORCE_GTC,
+                quantity=str(tp_qty),
+                price=str(tp_price),
                 reduceOnly=True
             )
-            logger.info(f"Set TP1: qty={tp_qty_1}, price={tp_price_1}")
-        else:
-            logger.warning(f"TP1 qty {tp_qty_1} < minQty {min_qty}, skipping")
+            logger.info(f"Set TP: qty={tp_qty}, price={tp_price}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set TP order: {e}")
+    else:
+        logger.warning(f"TP qty {tp_qty} < minQty {min_qty}, skipping TP")
 
-        # 2차 TP: entry_price * 1.011, 남은 잔량의 50%
-        tp_price_2 = round(entry_price * 1.011, 2)
-        remaining_qty = filled - tp_qty_1
-        tp_qty_2 = math.floor((remaining_qty * 0.5) / step) * step
-
-        if tp_qty_2 >= min_qty:
+    if sl_qty >= min_qty:
+        try:
             client.futures_create_order(
                 symbol=symbol,
-                side=SIDE_SELL,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=str(tp_price_2),
-                quantity=str(tp_qty_2),
+                side="SELL",
+                type="STOP_MARKET",
+                stopPrice=str(sl_price),
+                quantity=str(sl_qty),
                 reduceOnly=True
             )
-            logger.info(f"Set TP2: qty={tp_qty_2}, price={tp_price_2}")
-        else:
-            logger.warning(f"TP2 qty {tp_qty_2} < minQty {min_qty}, skipping")
-
-        # SL 설정
-        sl_price = round(entry_price * 0.995, 2)
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type="STOP_MARKET",
-            stopPrice=str(sl_price),
-            quantity=str(filled),
-            reduceOnly=True
-        )
-        logger.info(f"Set SL: qty={filled}, stopPrice={sl_price}")
-
-    except BinanceAPIException as e:
-        logger.error(f"Failed to set TP/SL orders: {e}")
+            logger.info(f"Set SL: qty={sl_qty}, stopPrice={sl_price}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set SL order: {e}")
+    else:
+        logger.warning(f"SL qty {sl_qty} < minQty {min_qty}, skipping SL")
 
     return {"buy": {"filled": filled, "entry": entry_price}}
