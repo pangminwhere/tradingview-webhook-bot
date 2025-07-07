@@ -36,25 +36,32 @@ def execute_sell(symbol: str) -> dict:
         # 잔고 기반 qty 계산
         balances = client.futures_account_balance()
         usdt_balance = float(next(b["balance"] for b in balances if b["asset"] == "USDT"))
-        allocation = usdt_balance * 0.98
 
         mark_price = float(client.futures_mark_price(symbol=symbol)["markPrice"])
+
+        # leverage 고려한 사용 가능 금액
+        allocation = usdt_balance * 0.98 * TRADE_LEVERAGE
+
         qty = allocation / mark_price
 
-        # 최소 수량 체크 및 3자리 올림
+        # 최소 수량 및 stepSize 처리
         info = client.futures_exchange_info()
         symbol_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
         lot_size_filter = next(f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE")
         step_size = float(lot_size_filter["stepSize"])
         min_qty = float(lot_size_filter["minQty"])
 
+        # step_size 기준으로 올림 처리
         qty = math.ceil(qty / step_size) * step_size
 
+        # qty가 min_qty 보다 작으면 min_qty 로 강제 진입
         if qty < min_qty:
-            logger.error(f"Calculated qty {qty} < min_qty {min_qty}, skipping entry.")
-            return {"skipped": "qty_too_small"}
+            logger.warning(f"Calculated qty {qty} < min_qty {min_qty}, forcing to min_qty.")
+            qty = min_qty
 
-        # 시장가 숏 진입
+        logger.info(f"Final qty to sell: {qty} at price: {mark_price}")
+
+        # 시장가 숏 진입 주문
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
@@ -63,7 +70,7 @@ def execute_sell(symbol: str) -> dict:
         )
         logger.info(f"SELL executed: {order}")
 
-        # 체결 정보 조회
+        # 체결 정보
         order_id = order["orderId"]
         order_details = client.futures_get_order(symbol=symbol, orderId=order_id)
         entry_price = float(order_details["avgPrice"])
