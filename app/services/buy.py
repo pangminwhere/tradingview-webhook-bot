@@ -1,153 +1,117 @@
 # app/services/buy.py
 
-import logging
-import time
 import math
+import logging
+from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from binance.exceptions import BinanceAPIException
-from binance.enums import (
-    SIDE_BUY,
-    SIDE_SELL,
-    ORDER_TYPE_MARKET,
-    ORDER_TYPE_LIMIT,
-    ORDER_TYPE_STOP_MARKET,
-    TIME_IN_FORCE_GTC,
-)
 from app.clients.binance_client import get_binance_client
-from app.config import (
-    DRY_RUN,
-    BUY_PCT,
-    TRADE_LEVERAGE,
-    POLL_INTERVAL,
-    MAX_WAIT,
-)
+from app.config import BUY_PCT, TRADE_LEVERAGE
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-def _wait_for_position(symbol: str, target_amt: float) -> bool:
-    client = get_binance_client()
-    start = time.time()
-    while time.time() - start < MAX_WAIT:
-        pos = client.futures_position_information(symbol=symbol)
-        current = float(next(p["positionAmt"] for p in pos if p["symbol"] == symbol))
-        if (target_amt > 0 and current > 0) or (target_amt == 0 and current == 0):
-            return True
-        time.sleep(POLL_INTERVAL)
-    logger.warning(f"Timeout while waiting for position {target_amt}")
-    return False
-
 def execute_buy(symbol: str) -> dict:
     client = get_binance_client()
 
-    if DRY_RUN:
-        logger.info(f"[DRY_RUN] BUY {symbol}")
-        return {"skipped": "dry_run"}
+    try:
+        client.futures_change_leverage(symbol=symbol, leverage=TRADE_LEVERAGE)
+        logger.info(f"Set leverage {TRADE_LEVERAGE}x for {symbol}")
 
-    client.futures_change_leverage(symbol=symbol, leverage=TRADE_LEVERAGE)
-    logger.info(f"Leverage set to {TRADE_LEVERAGE}x for {symbol}")
+        # Cancel existing reduceOnly orders
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        for order in open_orders:
+            client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
+            logger.info(f"Canceled open order: {order['orderId']}")
 
-    # Cancel existing reduceOnly orders
-    for order in client.futures_get_open_orders(symbol=symbol):
-        if order.get("reduceOnly"):
-            client.futures_cancel_order(symbol=symbol, orderId=order["orderId"])
+        # Check position
+        positions = client.futures_position_information(symbol=symbol)
+        position_amt = float(next(p for p in positions if p['symbol'] == symbol)['positionAmt'])
+        if position_amt > 0:
+            logger.info("Already in long position, skipping buy")
+            return {"skipped": "already_long"}
 
-    positions = client.futures_position_information(symbol=symbol)
-    current_amt = float(next(p["positionAmt"] for p in positions if p["symbol"] == symbol))
+        if position_amt < 0:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_BUY,
+                type=ORDER_TYPE_MARKET,
+                quantity=abs(position_amt),
+                reduceOnly=True
+            )
+            logger.info(f"Closed short position of {abs(position_amt)}")
 
-    if current_amt > 0:
-        return {"skipped": "already_long"}
+        # Calculate qty
+        usdt_balance = float(next(item['balance'] for item in client.futures_account_balance() if item['asset'] == 'USDT'))
+        alloc = usdt_balance * BUY_PCT
+        price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+        qty_raw = alloc / price
 
-    if current_amt < 0:
-        client.futures_create_order(
+        # Precision handling: truncate to 3 decimals (floor)
+        info = client.futures_exchange_info()
+        symbol_info = next(s for s in info['symbols'] if s['symbol'] == symbol)
+        lot_size_filter = next(f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE')
+        step_size = float(lot_size_filter['stepSize'])
+        min_qty = float(lot_size_filter['minQty'])
+
+        qty = math.floor(qty_raw / step_size) * step_size
+        qty = round(qty, 3)
+
+        if qty < min_qty:
+            logger.warning(f"Calculated qty {qty} < min_qty {min_qty}, skipping buy")
+            return {"skipped": "qty_below_min"}
+
+        # Market buy
+        order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
             type=ORDER_TYPE_MARKET,
-            quantity=str(abs(current_amt)),
-            reduceOnly=True
+            quantity=qty
         )
-        if not _wait_for_position(symbol, 0):
-            return {"skipped": "close_failed"}
+        avg_price = float(order['fills'][0]['price'])
+        logger.info(f"Bought {qty} {symbol} at {avg_price}")
 
-    # Calculate qty using 98% of balance
-    usdt_balance = float(next(a["balance"] for a in client.futures_account_balance() if a["asset"] == "USDT"))
-    alloc = usdt_balance * BUY_PCT
-    price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    raw_qty = alloc / price
+        # Setting TP1, TP2, SL using MARKET orders with reduceOnly
+        tp1_qty = math.ceil(qty * 0.3 / step_size) * step_size
+        tp2_qty = math.ceil((qty - tp1_qty) * 0.5 / step_size) * step_size
 
-    # Step precision
-    info = client.futures_exchange_info()
-    symbol_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
-    lot_filter = next(f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE")
-    step_size = float(lot_filter["stepSize"])
-
-    qty = math.floor(raw_qty / step_size) * step_size
-    qty = round(qty, 3)
-
-    if qty < 0.001:
-        logger.warning(f"Qty {qty} below min trade size, skipping.")
-        return {"skipped": "qty_too_small"}
-
-    # Market Buy
-    order = client.futures_create_order(
-        symbol=symbol,
-        side=SIDE_BUY,
-        type=ORDER_TYPE_MARKET,
-        quantity=str(qty)
-    )
-    if not _wait_for_position(symbol, qty):
-        return {"skipped": "open_failed"}
-
-    order_info = client.futures_get_order(symbol=symbol, orderId=order["orderId"])
-    filled = float(order_info["executedQty"])
-    entry_price = float(order_info["avgPrice"])
-
-    logger.info(f"BUY executed: {filled} @ {entry_price}")
-
-    # 예약 TP / SL 설정
-    tp1_price = math.ceil(entry_price * 1.005 * 100) / 100  # 2째자리 올림
-    tp2_price = math.ceil(entry_price * 1.011 * 100) / 100
-    sl_price = math.ceil(entry_price * 0.995 * 100) / 100
-
-    tp1_qty = math.ceil(filled * 0.3 * 1000) / 1000  # 3째자리 올림
-    tp2_qty = math.ceil(filled * 0.5 * 1000) / 1000
-
-    try:
-        if tp1_qty >= 0.001:
+        try:
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_SELL,
-                type=ORDER_TYPE_LIMIT,
-                quantity=str(tp1_qty),
-                price=str(tp1_price),
-                timeInForce=TIME_IN_FORCE_GTC,
+                type=ORDER_TYPE_MARKET,
+                quantity=tp1_qty,
                 reduceOnly=True
             )
-            logger.info(f"1st TP set: {tp1_qty} @ {tp1_price}")
+            logger.info(f"Set TP1: {tp1_qty} {symbol}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set TP1: {e}")
 
-        if tp2_qty >= 0.001:
+        try:
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_SELL,
-                type=ORDER_TYPE_LIMIT,
-                quantity=str(tp2_qty),
-                price=str(tp2_price),
-                timeInForce=TIME_IN_FORCE_GTC,
+                type=ORDER_TYPE_MARKET,
+                quantity=tp2_qty,
                 reduceOnly=True
             )
-            logger.info(f"2nd TP set: {tp2_qty} @ {tp2_price}")
+            logger.info(f"Set TP2: {tp2_qty} {symbol}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set TP2: {e}")
 
-        # SL은 전체 포지션 크기 그대로 사용 (정밀도 불필요, reduceOnly로만)
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type=ORDER_TYPE_STOP_MARKET,
-            stopPrice=str(sl_price),
-            quantity=str(filled),
-            reduceOnly=True
-        )
-        logger.info(f"SL set: {filled} @ {sl_price}")
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type=ORDER_TYPE_MARKET,
+                quantity=qty,
+                reduceOnly=True
+            )
+            logger.info(f"Set SL: {qty} {symbol}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set SL: {e}")
 
-    except BinanceAPIException as e:
-        logger.error(f"Failed to set TP/SL: {e}")
+        return {"status": "buy_placed", "qty": qty, "entry_price": avg_price}
 
-    return {"buy": {"filled": filled, "entry_price": entry_price}}
+    except Exception as e:
+        logger.error(f"Buy order failed: {e}")
+        return {"error": str(e)}
