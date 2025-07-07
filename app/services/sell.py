@@ -1,9 +1,11 @@
-import logging
+# app/services/sell.py
+
 import math
+import logging
+from binance.enums import SIDE_SELL, SIDE_BUY, ORDER_TYPE_MARKET, TIME_IN_FORCE_GTC
 from binance.exceptions import BinanceAPIException
-from binance.enums import SIDE_SELL, ORDER_TYPE_MARKET
 from app.clients.binance_client import get_binance_client
-from app.config import DRY_RUN, TRADE_LEVERAGE
+from app.config import SELL_PCT, TRADE_LEVERAGE
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -11,65 +13,121 @@ logger.setLevel(logging.INFO)
 def execute_sell(symbol: str) -> dict:
     client = get_binance_client()
 
-    if DRY_RUN:
-        logger.info(f"[DRY_RUN] SELL {symbol}")
-        return {"skipped": "dry_run"}
-
     try:
-        # 1) 레버리지 설정
+        # 레버리지 설정
         client.futures_change_leverage(symbol=symbol, leverage=TRADE_LEVERAGE)
-        logger.info(f"Leverage set to {TRADE_LEVERAGE}x for {symbol}")
+        logger.info(f"Set leverage {TRADE_LEVERAGE}x for {symbol}")
 
-        # 2) reduceOnly 주문 삭제
-        for order in client.futures_get_open_orders(symbol=symbol):
-            if order.get("reduceOnly"):
-                client.futures_cancel_order(symbol=symbol, orderId=order["orderId"])
-                logger.info(f"Canceled reduceOnly order {order['orderId']}")
+        # 기존 TP/SL 예약 주문 삭제
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        for order in open_orders:
+            client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
+            logger.info(f"Canceled open order: {order['orderId']}")
 
-        # 3) qty 계산
-        balances = client.futures_account_balance()
-        usdt_balance = float(next(b["balance"] for b in balances if b["asset"] == "USDT"))
-        mark_price = float(client.futures_mark_price(symbol=symbol)["markPrice"])
-        allocation = usdt_balance * 0.98 * TRADE_LEVERAGE
-        raw_qty = allocation / mark_price
+        # 현재 포지션 확인
+        positions = client.futures_position_information(symbol=symbol)
+        position_amt = float(next(p for p in positions if p['symbol'] == symbol)['positionAmt'])
+        if position_amt < 0:
+            logger.info("Already in short, skipping entry")
+            return {"skipped": "already_short"}
 
-        # LOT_SIZE 정보 조회
+        # 포지션 청산 후 숏 진입
+        if position_amt > 0:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type=ORDER_TYPE_MARKET,
+                quantity=position_amt,
+                reduceOnly=True
+            )
+            logger.info(f"Closed long position of {position_amt}")
+
+        # 잔고 기반 매도 수량 계산
+        usdt_balance = float(next(item['balance'] for item in client.futures_account_balance() if item['asset'] == 'USDT'))
+        alloc = usdt_balance * SELL_PCT
+        price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+        qty_raw = alloc / price
+
+        # 심볼별 정밀도 확인
         info = client.futures_exchange_info()
-        symbol_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
-        lot_size_filter = next(f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE")
-        step_size = float(lot_size_filter["stepSize"])
-        min_qty = float(lot_size_filter["minQty"])
+        symbol_info = next(s for s in info['symbols'] if s['symbol'] == symbol)
+        lot_size_filter = next(f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE')
+        step_size = float(lot_size_filter['stepSize'])
+        min_qty = float(lot_size_filter['minQty'])
 
-        # 셋째 자리까지만 버림
-        qty = math.floor(raw_qty / step_size) * step_size
+        # 셋째자리 올림으로 수량 설정
+        qty = math.ceil(qty_raw / step_size) * step_size
+        qty = round(qty, 3)
 
         if qty < min_qty:
-            logger.warning(f"Qty {qty} < minQty {min_qty}. Skipping SELL.")
-            return {"skipped": "quantity_too_low"}
+            logger.warning(f"Calculated qty {qty} < min_qty {min_qty}, skipping sell entry")
+            return {"skipped": "qty_below_min"}
 
-        logger.info(f"Selling {qty} {symbol} at ~{mark_price}")
-
+        # 시장가 숏 진입
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
             type=ORDER_TYPE_MARKET,
-            quantity=str(qty)
+            quantity=qty
         )
+        avg_price = float(order['fills'][0]['price'])
+        logger.info(f"Entered short: {qty} {symbol} at {avg_price}")
 
-        logger.info(f"SELL executed: {order}")
+        # TP1 설정 (30% 분할 청산)
+        tp1_qty = math.ceil(qty * 0.3 / step_size) * step_size
+        tp1_qty = round(tp1_qty, 3)
+        tp1_price = avg_price * 0.99  # 1% 이익 목표
+        tp1_price = round(tp1_price, 2)
 
-        order_id = order["orderId"]
-        order_details = client.futures_get_order(symbol=symbol, orderId=order_id)
-        entry_price = float(order_details["avgPrice"])
-        executed_qty = float(order_details["executedQty"])
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_BUY,
+                type=ORDER_TYPE_MARKET,
+                quantity=tp1_qty,
+                reduceOnly=True
+            )
+            logger.info(f"Set 1st TP: qty={tp1_qty}, price={tp1_price}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set 1st TP: {e}")
 
-        logger.info(f"Entry: {executed_qty} @ {entry_price}")
+        # TP2 설정 (남은 물량의 50% 청산)
+        remaining_qty = qty - tp1_qty
+        tp2_qty = math.ceil(remaining_qty * 0.5 / step_size) * step_size
+        tp2_qty = round(tp2_qty, 3)
+        tp2_price = avg_price * 0.98  # 2% 이익 목표
+        tp2_price = round(tp2_price, 2)
 
-        return {"sell": {"filled": executed_qty, "entry": entry_price}}
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_BUY,
+                type=ORDER_TYPE_MARKET,
+                quantity=tp2_qty,
+                reduceOnly=True
+            )
+            logger.info(f"Set 2nd TP: qty={tp2_qty}, price={tp2_price}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set 2nd TP: {e}")
 
-    except BinanceAPIException as e:
-        logger.error(f"Sell order failed: {e}")
-        return {"skipped": "api_error", "error": str(e)}
+        # SL 설정 (전체 물량 손절)
+        sl_price = avg_price * 1.005  # -0.5% 손절 기준
+        sl_price = round(sl_price, 2)
+
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_BUY,
+                type=ORDER_TYPE_MARKET,
+                quantity=qty,
+                reduceOnly=True
+            )
+            logger.info(f"Set SL: qty={qty}, price={sl_price}")
+        except BinanceAPIException as e:
+            logger.error(f"Failed to set SL: {e}")
+
+        return {"status": "sell_placed", "qty": qty, "entry_price": avg_price}
+
     except Exception as e:
-        logger.exception(f"Unexpected error in execute_sell: {e}")
-        return {"skipped": "unexpected_error", "error": str(e)}
+        logger.error(f"Sell order failed: {e}")
+        return {"error": str(e)}
