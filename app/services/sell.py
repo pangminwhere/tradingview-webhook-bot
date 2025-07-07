@@ -3,15 +3,13 @@ import math
 import threading
 import time
 from binance.exceptions import BinanceAPIException
-from binance.enums import (
-    SIDE_SELL,
-    SIDE_BUY,
-    ORDER_TYPE_MARKET,
-    ORDER_TYPE_TAKE_PROFIT_MARKET,
-    ORDER_TYPE_STOP_MARKET,
-)
+from binance.enums import SIDE_SELL, SIDE_BUY, ORDER_TYPE_MARKET
 from app.clients.binance_client import get_binance_client
 from app.config import DRY_RUN, TRADE_LEVERAGE, POLL_INTERVAL
+
+# 문자열 상수로 TP/SL 마켓 주문 타입 지정
+TP_MARKET = "TAKE_PROFIT_MARKET"
+SL_MARKET = "STOP_MARKET"
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -57,7 +55,7 @@ def execute_sell(symbol: str) -> dict:
             logger.warning(f"Qty {qty} < minQty {min_qty}. Skipping SELL.")
             return {"skipped": "quantity_too_low"}
 
-        # 4) 시장가 진입 (숏 포지션)
+        # 4) 시장가 진입 (숏)
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
@@ -74,12 +72,12 @@ def execute_sell(symbol: str) -> dict:
 
         # 5) TP/SL 주문 걸기
         # 1차 TP: -0.5% → 30%
-        tp1_price        = round(entry_price * 0.995, price_precision)  # 1 - 0.005
+        tp1_price        = round(entry_price * 0.995, price_precision)
         tp1_qty          = math.floor(executed_qty * 0.30 / step_size) * step_size
         order_tp1        = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
-            type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+            type=TP_MARKET,
             stopPrice=str(tp1_price),
             reduceOnly=True,
             quantity=str(tp1_qty)
@@ -88,22 +86,22 @@ def execute_sell(symbol: str) -> dict:
         # 2차 TP: -1.1% → 남은 물량의 50%
         remain_after_tp1 = executed_qty - tp1_qty
         tp2_qty          = math.floor(remain_after_tp1 * 0.50 / step_size) * step_size
-        tp2_price        = round(entry_price * 0.989, price_precision)  # 1 - 0.011
+        tp2_price        = round(entry_price * 0.989, price_precision)
         order_tp2        = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
-            type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+            type=TP_MARKET,
             stopPrice=str(tp2_price),
             reduceOnly=True,
             quantity=str(tp2_qty)
         )
 
         # 기본 SL: +0.5% → 전체 수량
-        sl_price = round(entry_price * 1.005, price_precision)  # 1 + 0.005
+        sl_price = round(entry_price * 1.005, price_precision)
         order_sl = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
-            type=ORDER_TYPE_STOP_MARKET,
+            type=SL_MARKET,
             stopPrice=str(sl_price),
             reduceOnly=True,
             quantity=str(executed_qty)
@@ -127,11 +125,11 @@ def execute_sell(symbol: str) -> dict:
                         logger.info(f"Canceled original SL order {order_sl['orderId']} after TP1 fill")
 
                         # 남은 물량에 대해 SL 재설정 (+0.1%)
-                        new_sl_price = round(entry_price * 1.001, price_precision)  # 1 + 0.001
+                        new_sl_price = round(entry_price * 1.001, price_precision)
                         new_sl_order = client.futures_create_order(
                             symbol=symbol,
                             side=SIDE_BUY,
-                            type=ORDER_TYPE_STOP_MARKET,
+                            type=SL_MARKET,
                             stopPrice=str(new_sl_price),
                             reduceOnly=True,
                             quantity=str(remain_after_tp1)

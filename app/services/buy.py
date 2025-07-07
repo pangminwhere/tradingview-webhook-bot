@@ -3,15 +3,13 @@ import math
 import threading
 import time
 from binance.exceptions import BinanceAPIException
-from binance.enums import (
-    SIDE_BUY,
-    SIDE_SELL,
-    ORDER_TYPE_MARKET,
-    ORDER_TYPE_TAKE_PROFIT_MARKET,
-    ORDER_TYPE_STOP_MARKET,
-)
+from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from app.clients.binance_client import get_binance_client
 from app.config import DRY_RUN, TRADE_LEVERAGE, POLL_INTERVAL
+
+# 문자열 상수로 TP/SL 마켓 주문 타입 지정
+TP_MARKET = "TAKE_PROFIT_MARKET"
+SL_MARKET = "STOP_MARKET"
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -79,7 +77,7 @@ def execute_buy(symbol: str) -> dict:
         order_tp1        = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
-            type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+            type=TP_MARKET,
             stopPrice=str(tp1_price),
             reduceOnly=True,
             quantity=str(tp1_qty)
@@ -92,7 +90,7 @@ def execute_buy(symbol: str) -> dict:
         order_tp2        = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
-            type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+            type=TP_MARKET,
             stopPrice=str(tp2_price),
             reduceOnly=True,
             quantity=str(tp2_qty)
@@ -103,7 +101,7 @@ def execute_buy(symbol: str) -> dict:
         order_sl = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
-            type=ORDER_TYPE_STOP_MARKET,
+            type=SL_MARKET,
             stopPrice=str(sl_price),
             reduceOnly=True,
             quantity=str(executed_qty)
@@ -131,7 +129,7 @@ def execute_buy(symbol: str) -> dict:
                         new_sl_order = client.futures_create_order(
                             symbol=symbol,
                             side=SIDE_SELL,
-                            type=ORDER_TYPE_STOP_MARKET,
+                            type=SL_MARKET,
                             stopPrice=str(new_sl_price),
                             reduceOnly=True,
                             quantity=str(remain_after_tp1)
