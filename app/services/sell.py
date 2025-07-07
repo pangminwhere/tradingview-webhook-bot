@@ -1,24 +1,19 @@
 import logging
-import decimal
+import math
 from binance.exceptions import BinanceAPIException
-from binance.enums import SIDE_SELL, SIDE_BUY, ORDER_TYPE_MARKET, ORDER_TYPE_LIMIT
+from binance.enums import (
+    SIDE_SELL,
+    ORDER_TYPE_MARKET,
+)
 from app.clients.binance_client import get_binance_client
 from app.config import (
     DRY_RUN,
     BUY_PCT,
     TRADE_LEVERAGE,
-    TP_RATIO,
-    TP_PART_RATIO,
-    SL_RATIO,
 )
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-def ceil_step_size(value, step_size):
-    d_value = decimal.Decimal(str(value))
-    d_step = decimal.Decimal(str(step_size))
-    return float((d_value / d_step).to_integral_value(rounding=decimal.ROUND_CEILING) * d_step)
 
 def execute_sell(symbol: str) -> dict:
     client = get_binance_client()
@@ -27,87 +22,60 @@ def execute_sell(symbol: str) -> dict:
         logger.info(f"[DRY_RUN] SELL {symbol}")
         return {"skipped": "dry_run"}
 
-    client.futures_change_leverage(symbol=symbol, leverage=TRADE_LEVERAGE)
-    logger.info(f"Leverage set to {TRADE_LEVERAGE}x for {symbol}")
-
-    for order in client.futures_get_open_orders(symbol=symbol):
-        if order.get("reduceOnly"):
-            client.futures_cancel_order(symbol=symbol, orderId=order["orderId"])
-            logger.info(f"Canceled reduceOnly order {order['orderId']}")
-
-    info = client.futures_exchange_info()
-    sym_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
-    lot = next(f for f in sym_info["filters"] if f["filterType"] == "LOT_SIZE")
-    step_size = float(lot["stepSize"])
-    price_filter = next(f for f in sym_info["filters"] if f["filterType"] == "PRICE_FILTER")
-    tick_size = float(price_filter["tickSize"])
-
-    bal_list = client.futures_account_balance()
-    usdt_bal = float(next(item["balance"] for item in bal_list if item["asset"] == "USDT"))
-    alloc = usdt_bal * BUY_PCT
-    price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    raw_qty = alloc / price
-    qty = ceil_step_size(raw_qty, step_size)
-
-    logger.info(f"USDT_BAL={usdt_bal}, ALLOC={alloc}, PRICE={price}, RAW_QTY={raw_qty}, QTY={qty}")
-
-    if qty <= 0:
-        logger.error("Qty <= 0, skipping sell")
-        return {"skipped": "qty_zero"}
-
     try:
+        # 레버리지 설정
+        client.futures_change_leverage(symbol=symbol, leverage=TRADE_LEVERAGE)
+        logger.info(f"Leverage set to {TRADE_LEVERAGE}x for {symbol}")
+
+        # 기존 reduceOnly 주문 취소
+        for order in client.futures_get_open_orders(symbol=symbol):
+            if order.get("reduceOnly"):
+                client.futures_cancel_order(symbol=symbol, orderId=order["orderId"])
+                logger.info(f"Canceled reduceOnly order {order['orderId']}")
+
+        # 잔고 기반 qty 계산
+        balances = client.futures_account_balance()
+        usdt_balance = float(next(b["balance"] for b in balances if b["asset"] == "USDT"))
+        allocation = usdt_balance * 0.98
+
+        mark_price = float(client.futures_mark_price(symbol=symbol)["markPrice"])
+        qty = allocation / mark_price
+
+        # 최소 수량 체크 및 3자리 올림
+        info = client.futures_exchange_info()
+        symbol_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
+        lot_size_filter = next(f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE")
+        step_size = float(lot_size_filter["stepSize"])
+        min_qty = float(lot_size_filter["minQty"])
+
+        qty = math.ceil(qty / step_size) * step_size
+
+        if qty < min_qty:
+            logger.error(f"Calculated qty {qty} < min_qty {min_qty}, skipping entry.")
+            return {"skipped": "qty_too_small"}
+
+        # 시장가 숏 진입
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
             type=ORDER_TYPE_MARKET,
-            quantity=qty
+            quantity=str(qty)
         )
-        logger.info(f"SELL order executed: {order}")
+        logger.info(f"SELL executed: {order}")
+
+        # 체결 정보 조회
+        order_id = order["orderId"]
+        order_details = client.futures_get_order(symbol=symbol, orderId=order_id)
+        entry_price = float(order_details["avgPrice"])
+        executed_qty = float(order_details["executedQty"])
+
+        logger.info(f"Entry complete: {executed_qty} @ {entry_price}")
+
+        return {"sell": {"filled": executed_qty, "entry": entry_price}}
+
     except BinanceAPIException as e:
         logger.error(f"Sell order failed: {e}")
-        return {"skipped": "sell_failed"}
-
-    entry_price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-
-    # TP
-    tp_price = ceil_step_size(entry_price / TP_RATIO, tick_size)
-    tp_qty = ceil_step_size(qty * TP_PART_RATIO, step_size)
-
-    if tp_qty > 0:
-        try:
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_BUY,
-                type=ORDER_TYPE_LIMIT,
-                timeInForce='GTC',
-                quantity=tp_qty,
-                price=tp_price,
-                reduceOnly=True
-            )
-            logger.info(f"1st TP set: qty={tp_qty}, price={tp_price}")
-        except BinanceAPIException as e:
-            logger.error(f"Failed to set 1st TP: {e}")
-    else:
-        logger.warning(f"TP qty {tp_qty} <= 0, skipping TP")
-
-    # SL
-    sl_price = ceil_step_size(entry_price / SL_RATIO, tick_size)
-    sl_qty = ceil_step_size(qty, step_size)
-
-    if sl_qty > 0:
-        try:
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_BUY,
-                type="STOP_MARKET",
-                stopPrice=sl_price,
-                quantity=sl_qty,
-                reduceOnly=True
-            )
-            logger.info(f"SL set: qty={sl_qty}, stopPrice={sl_price}")
-        except BinanceAPIException as e:
-            logger.error(f"Failed to set SL: {e}")
-    else:
-        logger.warning(f"SL qty {sl_qty} <= 0, skipping SL")
-
-    return {"sell": {"filled": qty, "entry": entry_price}}
+        return {"skipped": "api_error", "error": str(e)}
+    except Exception as e:
+        logger.exception(f"Unexpected error in execute_sell: {e}")
+        return {"skipped": "unexpected_error", "error": str(e)}
