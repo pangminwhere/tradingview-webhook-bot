@@ -1,5 +1,4 @@
 import logging
-import math
 import decimal
 from binance.exceptions import BinanceAPIException
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET, ORDER_TYPE_LIMIT
@@ -28,41 +27,34 @@ def execute_buy(symbol: str) -> dict:
         logger.info(f"[DRY_RUN] BUY {symbol}")
         return {"skipped": "dry_run"}
 
-    # 레버리지 설정
     client.futures_change_leverage(symbol=symbol, leverage=TRADE_LEVERAGE)
     logger.info(f"Leverage set to {TRADE_LEVERAGE}x for {symbol}")
 
-    # 기존 reduceOnly 주문 취소
     for order in client.futures_get_open_orders(symbol=symbol):
         if order.get("reduceOnly"):
             client.futures_cancel_order(symbol=symbol, orderId=order["orderId"])
-            logger.info(f"Canceled TP/SL order {order['orderId']}")
+            logger.info(f"Canceled reduceOnly order {order['orderId']}")
 
-    # 심볼 정보
     info = client.futures_exchange_info()
     sym_info = next(s for s in info["symbols"] if s["symbol"] == symbol)
-
     lot = next(f for f in sym_info["filters"] if f["filterType"] == "LOT_SIZE")
-    step_size = float(lot["stepSize"])   # ex) 0.001 ETH
-
+    step_size = float(lot["stepSize"])
     price_filter = next(f for f in sym_info["filters"] if f["filterType"] == "PRICE_FILTER")
-    tick_size = float(price_filter["tickSize"])  # ex) 0.01 USDT
+    tick_size = float(price_filter["tickSize"])
 
-    # 진입 수량 계산
     bal_list = client.futures_account_balance()
     usdt_bal = float(next(item["balance"] for item in bal_list if item["asset"] == "USDT"))
     alloc = usdt_bal * BUY_PCT
     price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
     raw_qty = alloc / price
-
     qty = ceil_step_size(raw_qty, step_size)
-    logger.info(f"Balance={usdt_bal}, alloc={alloc}, price={price}, raw_qty={raw_qty}, qty={qty}")
+
+    logger.info(f"USDT_BAL={usdt_bal}, ALLOC={alloc}, PRICE={price}, RAW_QTY={raw_qty}, QTY={qty}")
 
     if qty <= 0:
-        logger.error("Calculated qty <= 0, skipping entry")
-        return {"skipped": "calc_zero"}
+        logger.error("Qty <= 0, skipping buy")
+        return {"skipped": "qty_zero"}
 
-    # 시장가 매수
     try:
         order = client.futures_create_order(
             symbol=symbol,
@@ -75,10 +67,9 @@ def execute_buy(symbol: str) -> dict:
         logger.error(f"Buy order failed: {e}")
         return {"skipped": "buy_failed"}
 
-    # 체결 가격
     entry_price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
 
-    # TP 주문 (30%)
+    # TP
     tp_price = ceil_step_size(entry_price * TP_RATIO, tick_size)
     tp_qty = ceil_step_size(qty * TP_PART_RATIO, step_size)
 
@@ -99,7 +90,7 @@ def execute_buy(symbol: str) -> dict:
     else:
         logger.warning(f"TP qty {tp_qty} <= 0, skipping TP")
 
-    # SL 주문 (100%)
+    # SL
     sl_price = ceil_step_size(entry_price * SL_RATIO, tick_size)
     sl_qty = ceil_step_size(qty, step_size)
 
