@@ -2,6 +2,7 @@ import logging
 import math
 import threading
 import time
+
 from binance.exceptions import BinanceAPIException
 from binance.enums import SIDE_SELL, SIDE_BUY, ORDER_TYPE_MARKET
 from app.clients.binance_client import get_binance_client
@@ -47,20 +48,24 @@ def execute_sell(symbol: str) -> dict:
         step_size       = float(lot_filter["stepSize"])
         min_qty         = float(lot_filter["minQty"])
         tick_size       = float(price_filter["tickSize"])
+
+        # precision 계산
+        qty_precision   = int(round(-math.log10(step_size), 0))
         price_precision = int(round(-math.log10(tick_size), 0))
 
-        # 주문 가능한 수량으로 내림
+        # 4) 주문 수량: 소수점 셋째 자리에서 내림
         qty = math.floor(raw_qty / step_size) * step_size
         if qty < min_qty:
             logger.warning(f"Qty {qty} < minQty {min_qty}. Skipping SELL.")
             return {"skipped": "quantity_too_low"}
+        qty_str = f"{qty:.{qty_precision}f}"
 
-        # 4) 시장가 진입 (숏)
+        # 5) 시장가 진입 (숏)
         order = client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL,
             type=ORDER_TYPE_MARKET,
-            quantity=str(qty)
+            quantity=qty_str
         )
         logger.info(f"Market SELL submitted: {order}")
 
@@ -70,50 +75,61 @@ def execute_sell(symbol: str) -> dict:
         executed_qty = float(details["executedQty"])
         logger.info(f"Entry SHORT: {executed_qty}@{entry_price}")
 
-        # 5) TP/SL 주문 걸기
+        # 가격 올림 함수
+        def ceil_price(price: float) -> float:
+            factor = 10 ** price_precision
+            return math.ceil(price * factor) / factor
+
+        # 6) TP/SL 주문 걸기
         # 1차 TP: -0.5% → 30%
-        tp1_price        = round(entry_price * 0.995, price_precision)
-        tp1_qty          = math.floor(executed_qty * 0.30 / step_size) * step_size
-        order_tp1        = client.futures_create_order(
+        tp1_price     = ceil_price(entry_price * 0.995)
+        tp1_qty       = math.floor(executed_qty * 0.30 / step_size) * step_size
+        tp1_price_str = f"{tp1_price:.{price_precision}f}"
+        tp1_qty_str   = f"{tp1_qty:.{qty_precision}f}"
+        order_tp1     = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
             type=TP_MARKET,
-            stopPrice=str(tp1_price),
+            stopPrice=tp1_price_str,
             reduceOnly=True,
-            quantity=str(tp1_qty)
+            quantity=tp1_qty_str
         )
 
         # 2차 TP: -1.1% → 남은 물량의 50%
         remain_after_tp1 = executed_qty - tp1_qty
+        tp2_price        = ceil_price(entry_price * 0.989)
         tp2_qty          = math.floor(remain_after_tp1 * 0.50 / step_size) * step_size
-        tp2_price        = round(entry_price * 0.989, price_precision)
+        tp2_price_str    = f"{tp2_price:.{price_precision}f}"
+        tp2_qty_str      = f"{tp2_qty:.{qty_precision}f}"
         order_tp2        = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
             type=TP_MARKET,
-            stopPrice=str(tp2_price),
+            stopPrice=tp2_price_str,
             reduceOnly=True,
-            quantity=str(tp2_qty)
+            quantity=tp2_qty_str
         )
 
         # 기본 SL: +0.5% → 전체 수량
-        sl_price = round(entry_price * 1.005, price_precision)
-        order_sl = client.futures_create_order(
+        sl_price      = ceil_price(entry_price * 1.005)
+        sl_price_str  = f"{sl_price:.{price_precision}f}"
+        sl_qty_str    = f"{executed_qty:.{qty_precision}f}"
+        order_sl      = client.futures_create_order(
             symbol=symbol,
             side=SIDE_BUY,
             type=SL_MARKET,
-            stopPrice=str(sl_price),
+            stopPrice=sl_price_str,
             reduceOnly=True,
-            quantity=str(executed_qty)
+            quantity=sl_qty_str
         )
 
         logger.info(
-            f"Placed TP1 @ {tp1_price} x{tp1_qty}, "
-            f"TP2 @ {tp2_price} x{tp2_qty}, "
-            f"SL @ {sl_price} x{executed_qty}"
+            f"Placed TP1 @ {tp1_price_str} x{tp1_qty_str}, "
+            f"TP2 @ {tp2_price_str} x{tp2_qty_str}, "
+            f"SL @ {sl_price_str} x{sl_qty_str}"
         )
 
-        # 6) TP1 체결 모니터링 및 SL 이동
+        # 7) TP1 체결 모니터링 및 SL 이동
         def _monitor_tp1():
             try:
                 while True:
@@ -122,21 +138,23 @@ def execute_sell(symbol: str) -> dict:
                     if tp1_info.get("status") == "FILLED":
                         # 기존 SL 취소
                         client.futures_cancel_order(symbol=symbol, orderId=order_sl["orderId"])
-                        logger.info(f"Canceled original SL order {order_sl['orderId']} after TP1 fill")
+                        logger.info(f"Canceled SL {order_sl['orderId']} after TP1")
 
                         # 남은 물량에 대해 SL 재설정 (+0.1%)
-                        new_sl_price = round(entry_price * 1.001, price_precision)
-                        new_sl_order = client.futures_create_order(
+                        new_sl_price     = ceil_price(entry_price * 1.001)
+                        new_sl_price_str = f"{new_sl_price:.{price_precision}f}"
+                        remain_str       = f"{remain_after_tp1:.{qty_precision}f}"
+                        new_sl_order     = client.futures_create_order(
                             symbol=symbol,
                             side=SIDE_BUY,
                             type=SL_MARKET,
-                            stopPrice=str(new_sl_price),
+                            stopPrice=new_sl_price_str,
                             reduceOnly=True,
-                            quantity=str(remain_after_tp1)
+                            quantity=remain_str
                         )
                         logger.info(
-                            f"Moved SL to +0.1% @ {new_sl_price} x{remain_after_tp1}, "
-                            f"new SL orderId {new_sl_order['orderId']}"
+                            f"Moved SL to +0.1% @ {new_sl_price_str} x{remain_str}, "
+                            f"new SL id {new_sl_order['orderId']}"
                         )
                         break
             except Exception as e:
